@@ -37,9 +37,11 @@ const MAP_FLOOR_ATLAS := Vector2i(0, 0)
 const MAP_BORDER_ATLAS := Vector2i(1, 0)
 const DEFAULT_ARENA_TILESET_PATH := "res://resources/arena_tileset.tres"
 const PLAYER_SCENE := preload("res://scenes/actors/player.tscn")
+const GAME_VERSION := "0.1.0-dev"
 const SERVER_PEER_ID := 1
 const NETWORK_INPUT_INTERVAL := 0.033
 const WORLD_SNAPSHOT_INTERVAL := 0.08
+const LOBBY_AUTO_START_DELAY := 3.0
 const REVIVE_RADIUS := 72.0
 const REVIVE_RADIUS_SQ := REVIVE_RADIUS * REVIVE_RADIUS
 const REVIVE_BASE_TIME := 3.5
@@ -76,6 +78,7 @@ var relic_label: Label
 var network_session
 var network_status_label: Label
 var debug_label: Label
+var version_label: Label
 var network_ip_input: LineEdit
 var network_port_spin_box: SpinBox
 var lobby_overlay: ColorRect
@@ -106,12 +109,15 @@ var supply_caches: Array = []
 var holdout_events: Array = []
 var visual_effects := VisualEffectPoolResource.new()
 var upgrade_choices: Array = []
+var upgrade_choices_by_peer := {}
+var upgrade_selected_peer_ids := {}
+var upgrade_reward_source := UpgradeCatalog.REWARD_LEVEL
 var zombie_grid := {}
 var spawn_director := SpawnDirector.new()
 var elite_director := EliteDirector.new()
 var map_event_director := MapEventDirector.new()
 var weapon_loadout := WeaponLoadout.new()
-var upgrade_state := UpgradeState.new()
+var player_upgrade_states := {}
 var relics := RelicCollection.new()
 var meta_progression := MetaProgression.new()
 
@@ -135,6 +141,9 @@ var synced_upgrade_choice_key := ""
 var run_started := false
 var lobby_ready := {}
 var waiting_peer_ids := {}
+var run_participant_peer_ids := {}
+var lobby_auto_start_timer := -1.0
+var local_run_recorded := false
 var network_state := NET_STATE_OFFLINE_LOBBY
 var debug_overlay_visible := false
 var snapshot_debug := {
@@ -825,16 +834,52 @@ func _check_level_up() -> void:
 
 
 func _show_upgrade_choices(reward_source := UpgradeCatalog.REWARD_LEVEL) -> void:
+	choosing_upgrade = true
+	upgrade_reward_source = reward_source
+	upgrade_choices_by_peer.clear()
+	upgrade_selected_peer_ids.clear()
+	for peer_id in _upgrade_participant_peer_ids():
+		upgrade_choices_by_peer[peer_id] = _roll_upgrade_choices_for_peer(peer_id, reward_source)
+	_show_current_local_upgrade_choices()
+	_broadcast_world_snapshot_now()
+
+
+func _roll_upgrade_choices_for_peer(peer_id: int, reward_source := UpgradeCatalog.REWARD_LEVEL) -> Array:
+	var loadout = _ensure_player_loadout(peer_id)
+	var state = _ensure_player_upgrade_state(peer_id)
+	if reward_source == UpgradeCatalog.REWARD_CHEST:
+		return UpgradeCatalog.roll_chest_choices(rng, loadout, state, relics, level, elapsed, 3)
+	return UpgradeCatalog.roll_choices(rng, loadout, state, relics, level, elapsed, 3)
+
+
+func _show_current_local_upgrade_choices() -> void:
+	if not _has_local_active_player() or not upgrade_choices_by_peer.has(local_peer_id):
+		upgrade_overlay.visible = false
+		upgrade_choices.clear()
+		synced_upgrade_choice_key = ""
+		return
+	var already_selected := upgrade_selected_peer_ids.has(local_peer_id)
+	var hint := _upgrade_hint_for_source(upgrade_reward_source)
+	if already_selected:
+		hint = "已选择，等待其他玩家确认"
+	_show_local_upgrade_choices(
+		_upgrade_title_for_source(upgrade_reward_source),
+		hint,
+		upgrade_choices_by_peer.get(local_peer_id, []),
+		already_selected
+	)
+
+
+func _show_local_upgrade_choices(title: String, hint: String, choices: Array, already_selected: bool) -> void:
+	var choice_key := "%s|%s|%s" % [title, _upgrade_choice_key(choices), str(already_selected)]
+	if upgrade_overlay.visible and synced_upgrade_choice_key == choice_key:
+		upgrade_hint_label.text = hint
+		return
 	for child in upgrade_buttons_box.get_children():
 		child.queue_free()
-	if reward_source == UpgradeCatalog.REWARD_CHEST:
-		upgrade_title_label.text = "打开精英宝箱"
-		upgrade_hint_label.text = "选择一个高品质奖励"
-		upgrade_choices = UpgradeCatalog.roll_chest_choices(rng, weapon_loadout, upgrade_state, relics, level, elapsed, 3)
-	else:
-		upgrade_title_label.text = "选择一个变异强化"
-		upgrade_hint_label.text = "按 1/2/3 或点击按钮"
-		upgrade_choices = UpgradeCatalog.roll_choices(rng, weapon_loadout, upgrade_state, relics, level, elapsed, 3)
+	upgrade_title_label.text = title
+	upgrade_hint_label.text = hint
+	upgrade_choices = choices.duplicate(true)
 	for i in range(upgrade_choices.size()):
 		var upgrade: Dictionary = upgrade_choices[i]
 		var button := Button.new()
@@ -845,43 +890,78 @@ func _show_upgrade_choices(reward_source := UpgradeCatalog.REWARD_LEVEL) -> void
 			upgrade["desc"]
 		]
 		button.custom_minimum_size = Vector2(360.0, 44.0)
+		button.disabled = already_selected
 		button.pressed.connect(_choose_upgrade.bind(i))
 		upgrade_buttons_box.add_child(button)
-	synced_upgrade_choice_key = _upgrade_choice_key(upgrade_choices)
+	synced_upgrade_choice_key = choice_key
 	upgrade_overlay.visible = true
 
 
 func _choose_upgrade(index: int) -> void:
 	if _is_network_client():
-		if network_session != null:
+		if _has_local_active_player() and network_session != null:
 			network_session.send_upgrade_choice(index)
 		if upgrade_hint_label != null:
-			upgrade_hint_label.text = "已提交选择，等待房主确认"
+			upgrade_hint_label.text = "已提交选择，等待房主确认" if _has_local_active_player() else "观战中，不能选择升级"
 		for child in upgrade_buttons_box.get_children():
 			var button := child as Button
 			if button != null:
 				button.disabled = true
 		return
-	_apply_upgrade(index)
+	_apply_upgrade_for_peer(local_peer_id, index)
 
 
-func _apply_upgrade(index: int) -> void:
-	if index < 0 or index >= upgrade_choices.size():
+func _apply_upgrade_for_peer(peer_id: int, index: int) -> void:
+	if not choosing_upgrade:
 		return
-	var upgrade: Dictionary = upgrade_choices[index]
-	if not _apply_upgrade_to_team(upgrade):
+	if not _is_peer_active_in_current_run(peer_id):
 		return
+	if upgrade_selected_peer_ids.has(peer_id):
+		return
+	var choices: Array = upgrade_choices_by_peer.get(peer_id, [])
+	if index < 0 or index >= choices.size():
+		return
+	var upgrade: Dictionary = choices[index]
+	if not _apply_upgrade_to_peer(peer_id, upgrade):
+		upgrade = UpgradeCatalog.FALLBACK_UPGRADE.duplicate(true)
+		if not _apply_upgrade_to_peer(peer_id, upgrade):
+			return
 	match String(upgrade.get("type", "")):
 		"weapon_add", "weapon_evolve", "relic":
 			_play_feedback_sound("power", 0.16)
 		_:
 			_play_feedback_sound("upgrade", 0.1)
+	upgrade_selected_peer_ids[peer_id] = true
+	_show_current_local_upgrade_choices()
+	_finish_upgrade_phase_if_complete()
+	_broadcast_world_snapshot_now()
+
+
+func _finish_upgrade_phase_if_complete() -> void:
+	if _is_network_client():
+		return
+	if not choosing_upgrade:
+		return
+	for peer_id in _upgrade_participant_peer_ids():
+		if not upgrade_selected_peer_ids.has(peer_id):
+			return
 	choosing_upgrade = false
 	upgrade_overlay.visible = false
 	synced_upgrade_choice_key = ""
+	upgrade_choices_by_peer.clear()
+	upgrade_selected_peer_ids.clear()
+	upgrade_choices.clear()
 	_update_hud()
 	if xp >= xp_to_next:
 		_check_level_up()
+
+
+func _upgrade_title_for_source(reward_source: String) -> String:
+	return "打开精英宝箱" if reward_source == UpgradeCatalog.REWARD_CHEST else "选择一个个人强化"
+
+
+func _upgrade_hint_for_source(reward_source: String) -> String:
+	return "选择自己的高品质奖励" if reward_source == UpgradeCatalog.REWARD_CHEST else "按 1/2/3 或点击按钮"
 	_broadcast_world_snapshot_now()
 
 
@@ -937,6 +1017,16 @@ func _create_ui() -> void:
 	debug_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	debug_label.visible = false
 	root.add_child(debug_label)
+
+	version_label = Label.new()
+	version_label.text = "v%s  协议 %d" % [GAME_VERSION, NetworkSessionResource.PROTOCOL_VERSION]
+	version_label.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+	version_label.position = Vector2(-190.0, -28.0)
+	version_label.size = Vector2(170.0, 20.0)
+	version_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	version_label.add_theme_font_size_override("font_size", 12)
+	version_label.add_theme_color_override("font_color", Color(0.65, 0.72, 0.74))
+	root.add_child(version_label)
 
 	_create_lobby_overlay(root)
 
@@ -1121,9 +1211,11 @@ func _setup_player() -> void:
 	player.name = "Player_%d" % SERVER_PEER_ID
 	players.clear()
 	player_weapon_loadouts.clear()
+	player_upgrade_states.clear()
 	players[SERVER_PEER_ID] = player
 	player.set_display_color(_player_color(SERVER_PEER_ID))
 	_ensure_player_loadout(SERVER_PEER_ID)
+	_ensure_player_upgrade_state(SERVER_PEER_ID)
 	_refresh_player_identity_markers()
 
 
@@ -1170,6 +1262,14 @@ func _has_local_active_player() -> bool:
 	return players.has(local_peer_id) and not waiting_peer_ids.has(local_peer_id)
 
 
+func _is_peer_active_in_current_run(peer_id: int) -> bool:
+	return run_started and players.has(peer_id) and not waiting_peer_ids.has(peer_id)
+
+
+func _is_peer_participant(peer_id: int) -> bool:
+	return run_participant_peer_ids.has(peer_id)
+
+
 func _update_debug_overlay() -> void:
 	if debug_label == null:
 		return
@@ -1194,8 +1294,10 @@ func _debug_overlay_text() -> String:
 		+ "mode: %s  peer: %d/%d\n" % [mode, local_peer_id, peer_count]
 		+ "local: %s\n" % local_status
 		+ "active: %s\n" % _debug_peer_list(players.keys())
+		+ "participants: %s\n" % _debug_peer_list(run_participant_peer_ids.keys())
 		+ "waiting: %s\n" % _debug_peer_list(waiting_peer_ids.keys())
 		+ "ready: %s\n" % _debug_ready_list()
+		+ "auto start: %.1f\n" % lobby_auto_start_timer
 		+ "entities: P%d Z%d B%d XP%d\n" % [players.size(), zombies.size(), bullets.size(), xp_orbs.size()]
 		+ "snapshot: %d bytes  recv %d  sent %d  age %dms\n" % [
 			int(snapshot_debug.get("last_size", 0)),
@@ -1264,11 +1366,33 @@ func _broadcast_world_snapshot_now() -> void:
 
 
 func _update_lobby_network(delta: float) -> void:
+	_update_lobby_auto_start(delta)
 	if network_session != null and network_session.is_host():
 		world_snapshot_timer -= delta
 		if world_snapshot_timer <= 0.0:
 			_broadcast_world_snapshot_now()
 	_update_lobby_ui()
+
+
+func _update_lobby_auto_start(delta: float) -> void:
+	if network_session == null or not network_session.is_host() or run_started:
+		return
+	if not _all_lobby_players_ready():
+		_cancel_lobby_auto_start()
+		return
+	if lobby_auto_start_timer < 0.0:
+		lobby_auto_start_timer = LOBBY_AUTO_START_DELAY
+		_broadcast_world_snapshot_now()
+		return
+	lobby_auto_start_timer -= delta
+	if lobby_auto_start_timer <= 0.0:
+		lobby_auto_start_timer = -1.0
+		_start_run_from_lobby(true)
+
+
+func _cancel_lobby_auto_start() -> void:
+	if lobby_auto_start_timer >= 0.0:
+		lobby_auto_start_timer = -1.0
 
 
 func _request_restart() -> void:
@@ -1293,6 +1417,9 @@ func _enter_lobby() -> void:
 	run_started = false
 	game_over = false
 	choosing_upgrade = false
+	lobby_auto_start_timer = -1.0
+	local_run_recorded = false
+	run_participant_peer_ids.clear()
 	_clear_network_view_state()
 	if not players.has(SERVER_PEER_ID):
 		_ensure_player(SERVER_PEER_ID)
@@ -1327,6 +1454,7 @@ func _start_offline_game() -> void:
 	waiting_peer_ids.clear()
 	lobby_ready.clear()
 	lobby_ready[SERVER_PEER_ID] = true
+	lobby_auto_start_timer = -1.0
 	_start_run_from_lobby(false)
 
 
@@ -1351,7 +1479,10 @@ func _start_lobby_game() -> void:
 
 func _start_run_from_lobby(should_broadcast_start: bool) -> void:
 	run_started = true
+	lobby_auto_start_timer = -1.0
+	local_run_recorded = false
 	waiting_peer_ids.clear()
+	_set_run_participants_from_current_players()
 	if lobby_overlay != null:
 		lobby_overlay.visible = false
 	if should_broadcast_start and network_session != null:
@@ -1372,6 +1503,7 @@ func _host_lan_game() -> void:
 		waiting_peer_ids.clear()
 		lobby_ready.clear()
 		lobby_ready[SERVER_PEER_ID] = false
+		lobby_auto_start_timer = -1.0
 		_clear_network_view_state()
 		_refresh_player_identity_markers()
 		_update_lobby_ui()
@@ -1389,6 +1521,7 @@ func _join_lan_game() -> void:
 	local_peer_id = network_session.local_peer_id()
 	player = _ensure_player(local_peer_id)
 	run_started = false
+	lobby_auto_start_timer = -1.0
 	_clear_network_view_state()
 	_refresh_player_identity_markers()
 	_update_lobby_ui()
@@ -1409,6 +1542,7 @@ func _on_network_mode_changed(_mode: String, status: String) -> void:
 		player = _ensure_player(local_peer_id)
 		lobby_ready[local_peer_id] = false
 		run_started = false
+		lobby_auto_start_timer = -1.0
 		if lobby_overlay != null:
 			lobby_overlay.visible = true
 	else:
@@ -1424,6 +1558,7 @@ func _on_network_peer_joined(peer_id: int) -> void:
 	if not run_started:
 		_ensure_player(peer_id)
 		lobby_ready[peer_id] = false
+		_cancel_lobby_auto_start()
 		_refresh_player_identity_markers()
 		_update_lobby_ui()
 		_broadcast_world_snapshot_now()
@@ -1441,6 +1576,8 @@ func _on_network_peer_left(peer_id: int) -> void:
 		_remove_player(peer_id)
 	waiting_peer_ids.erase(peer_id)
 	lobby_ready.erase(peer_id)
+	_cancel_lobby_auto_start()
+	_finish_upgrade_phase_if_complete()
 	_refresh_player_identity_markers()
 	_update_lobby_ui()
 	_broadcast_world_snapshot_now()
@@ -1458,7 +1595,9 @@ func _on_network_upgrade_choice_received(peer_id: int, choice_index: int) -> voi
 		return
 	if not choosing_upgrade:
 		return
-	_apply_upgrade(choice_index)
+	if not _is_peer_active_in_current_run(peer_id):
+		return
+	_apply_upgrade_for_peer(peer_id, choice_index)
 	if network_status_label != null and network_session != null and network_session.is_host():
 		network_status_label.text = "玩家 %d 选择了升级" % peer_id
 
@@ -1480,6 +1619,7 @@ func _on_network_lobby_ready_received(peer_id: int, is_ready: bool) -> void:
 	_ensure_player(peer_id)
 	_refresh_player_identity_markers()
 	lobby_ready[peer_id] = is_ready
+	_cancel_lobby_auto_start()
 	_update_lobby_ui()
 	_broadcast_world_snapshot_now()
 
@@ -1514,6 +1654,7 @@ func _ensure_player(peer_id: int) -> Player:
 	new_player.reset(_spawn_position_for_peer(peer_id), selected_character)
 	new_player.set_display_color(_player_color(peer_id))
 	_ensure_player_loadout(peer_id)
+	_ensure_player_upgrade_state(peer_id)
 	return new_player
 
 
@@ -1523,6 +1664,9 @@ func _remove_player(peer_id: int) -> void:
 	var old_player := players[peer_id] as Player
 	players.erase(peer_id)
 	player_weapon_loadouts.erase(peer_id)
+	player_upgrade_states.erase(peer_id)
+	upgrade_choices_by_peer.erase(peer_id)
+	upgrade_selected_peer_ids.erase(peer_id)
 	if old_player != null and old_player != player:
 		old_player.queue_free()
 	if player == old_player:
@@ -1536,6 +1680,14 @@ func _ensure_player_loadout(peer_id: int):
 	loadout.reset(selected_starting_weapon)
 	player_weapon_loadouts[peer_id] = loadout
 	return loadout
+
+
+func _ensure_player_upgrade_state(peer_id: int):
+	if player_upgrade_states.has(peer_id):
+		return player_upgrade_states[peer_id]
+	var state := UpgradeState.new()
+	player_upgrade_states[peer_id] = state
+	return state
 
 
 func _player_color(peer_id: int) -> Color:
@@ -1700,56 +1852,27 @@ func _update_holdout_event_progress(event, delta: float) -> void:
 		event.progress = maxf(event.progress - delta * 0.35, 0.0)
 
 
-func _apply_upgrade_to_team(upgrade: Dictionary) -> bool:
-	var upgrade_type: String = upgrade.get("type", "")
-	match upgrade_type:
-		"passive":
-			if not upgrade_state.apply_passive(upgrade):
-				return false
-			for active_player in players.values():
-				var typed_player := active_player as Player
-				if typed_player != null:
-					typed_player.apply_upgrade(String(upgrade.get("stat", "")))
-			return true
-		"weapon_add", "weapon_level", "weapon_evolve":
-			var applied := weapon_loadout.apply_upgrade(upgrade)
-			for loadout in player_weapon_loadouts.values():
-				applied = loadout.apply_upgrade(upgrade) or applied
-			return applied
-		"relic":
-			return relics.add(String(upgrade.get("id", "")))
-		"heal":
-			for active_player in players.values():
-				var typed_player := active_player as Player
-				if typed_player != null:
-					typed_player.heal(30.0)
-			return true
-	return false
+func _upgrade_participant_peer_ids() -> Array:
+	var peer_ids := []
+	for peer_id in run_participant_peer_ids.keys():
+		var peer_int := int(peer_id)
+		if players.has(peer_int) and not waiting_peer_ids.has(peer_int):
+			peer_ids.append(peer_int)
+	peer_ids.sort()
+	return peer_ids
 
 
-func _show_synced_upgrade_choices(title: String, hint: String, choices: Array) -> void:
-	var choice_key := _upgrade_choice_key(choices)
-	if upgrade_overlay.visible and synced_upgrade_choice_key == choice_key:
-		return
-	for child in upgrade_buttons_box.get_children():
-		child.queue_free()
-	upgrade_title_label.text = title
-	upgrade_hint_label.text = hint
-	upgrade_choices = choices.duplicate(true)
-	for i in range(upgrade_choices.size()):
-		var upgrade: Dictionary = upgrade_choices[i]
-		var button := Button.new()
-		button.text = "%d. [%s] %s - %s" % [
-			i + 1,
-			UpgradeCatalog.rarity_label(upgrade.get("rarity", "common")),
-			upgrade.get("title", "未知奖励"),
-			upgrade.get("desc", "")
-		]
-		button.custom_minimum_size = Vector2(360.0, 44.0)
-		button.pressed.connect(_choose_upgrade.bind(i))
-		upgrade_buttons_box.add_child(button)
-	synced_upgrade_choice_key = choice_key
-	upgrade_overlay.visible = true
+func _apply_upgrade_to_peer(peer_id: int, upgrade: Dictionary) -> bool:
+	var target_player := players.get(peer_id, null) as Player
+	if target_player == null:
+		return false
+	return UpgradeCatalog.apply_upgrade(
+		upgrade,
+		target_player,
+		_ensure_player_loadout(peer_id),
+		_ensure_player_upgrade_state(peer_id),
+		relics
+	)
 
 
 func _upgrade_choice_key(choices: Array) -> String:
@@ -1803,19 +1926,14 @@ func _update_lobby_ui() -> void:
 	var can_ready: bool = not run_started and (is_host or network_session == null or network_session.is_offline() or network_session.mode == NetworkSessionResource.MODE_CLIENT)
 	lobby_overlay.visible = not run_started
 	if lobby_status_label != null:
-		if is_host:
-			lobby_status_label.text = "房间 IP %s  端口 %d" % [_lan_address_hint(), int(network_port_spin_box.value)]
-		elif is_client:
-			lobby_status_label.text = network_session.status_text
-		else:
-			lobby_status_label.text = "选择单人开始，或开房等待队友加入。"
+		lobby_status_label.text = _lobby_status_text(is_host, is_client)
 	if lobby_ready_button != null:
 		lobby_ready_button.visible = in_network_session
 		lobby_ready_button.disabled = not can_ready
 		lobby_ready_button.text = "取消准备" if local_ready else "准备"
 	if lobby_start_button != null:
-		lobby_start_button.visible = in_network_session and not is_client
-		lobby_start_button.disabled = is_host and not _all_lobby_players_ready()
+		lobby_start_button.visible = false
+		lobby_start_button.disabled = true
 	if lobby_single_button != null:
 		lobby_single_button.disabled = in_network_session
 	if lobby_host_button != null:
@@ -1835,6 +1953,18 @@ func _update_lobby_ui() -> void:
 			network_status_label.text = "大厅：单人"
 
 
+func _lobby_status_text(is_host: bool, is_client: bool) -> String:
+	if is_host:
+		if lobby_auto_start_timer >= 0.0:
+			return "全员已准备，%.1f 秒后自动开始。" % maxf(lobby_auto_start_timer, 0.0)
+		return "房间 IP %s  端口 %d，所有玩家准备后自动开始。" % [_lan_address_hint(), int(network_port_spin_box.value)]
+	if is_client:
+		if lobby_auto_start_timer >= 0.0:
+			return "全员已准备，等待房主自动开局 %.1f 秒。" % maxf(lobby_auto_start_timer, 0.0)
+		return network_session.status_text
+	return "选择单人开始，或开房等待队友加入。"
+
+
 func _lobby_players_text() -> String:
 	var lines := ["队伍"]
 	for peer_id in _lobby_player_ids():
@@ -1850,9 +1980,12 @@ func _lobby_players_text() -> String:
 		lines.append("%s  %s" % [label, ready_text])
 	if lines.size() == 1:
 		lines.append("尚未创建房间")
-	if network_session != null and network_session.is_host() and not _all_lobby_players_ready():
+	if network_session != null and network_session.is_host() and lobby_auto_start_timer >= 0.0:
 		lines.append("")
-		lines.append("所有玩家准备后才能开始。")
+		lines.append("即将自动开始。")
+	elif network_session != null and network_session.is_host() and not _all_lobby_players_ready():
+		lines.append("")
+		lines.append("所有玩家准备后自动开始。")
 	return "\n".join(lines)
 
 
@@ -1896,6 +2029,61 @@ func _serialize_waiting_peer_ids() -> Array:
 	return ids
 
 
+func _serialize_run_participant_peer_ids() -> Array:
+	var ids := []
+	for peer_id in run_participant_peer_ids.keys():
+		ids.append(int(peer_id))
+	ids.sort()
+	return ids
+
+
+func _set_run_participants_from_current_players() -> void:
+	run_participant_peer_ids.clear()
+	for peer_id in players.keys():
+		run_participant_peer_ids[int(peer_id)] = true
+
+
+func _apply_run_participant_peer_ids_snapshot(participant_data) -> void:
+	run_participant_peer_ids.clear()
+	if not (participant_data is Array):
+		return
+	for peer_id in participant_data:
+		run_participant_peer_ids[int(peer_id)] = true
+
+
+func _serialize_upgrade_choices_by_peer() -> Dictionary:
+	var data := {}
+	for peer_id in upgrade_choices_by_peer.keys():
+		data[str(peer_id)] = upgrade_choices_by_peer[peer_id]
+	return data
+
+
+func _apply_upgrade_choices_by_peer_snapshot(raw_data) -> void:
+	upgrade_choices_by_peer.clear()
+	if not (raw_data is Dictionary):
+		return
+	for peer_key in raw_data.keys():
+		var choices = raw_data[peer_key]
+		if choices is Array:
+			upgrade_choices_by_peer[int(str(peer_key))] = choices
+
+
+func _serialize_upgrade_selected_peer_ids() -> Array:
+	var ids := []
+	for peer_id in upgrade_selected_peer_ids.keys():
+		ids.append(int(peer_id))
+	ids.sort()
+	return ids
+
+
+func _apply_upgrade_selected_peer_ids_snapshot(raw_data) -> void:
+	upgrade_selected_peer_ids.clear()
+	if not (raw_data is Array):
+		return
+	for peer_id in raw_data:
+		upgrade_selected_peer_ids[int(peer_id)] = true
+
+
 func _apply_waiting_peer_ids_snapshot(waiting_data) -> void:
 	waiting_peer_ids.clear()
 	if not (waiting_data is Array):
@@ -1913,6 +2101,9 @@ func _clear_network_view_state() -> void:
 	holdout_events.clear()
 	visual_effects.clear()
 	upgrade_choices.clear()
+	upgrade_choices_by_peer.clear()
+	upgrade_selected_peer_ids.clear()
+	upgrade_reward_source = UpgradeCatalog.REWARD_LEVEL
 	zombie_grid.clear()
 	choosing_upgrade = false
 	synced_upgrade_choice_key = ""
@@ -1936,6 +2127,7 @@ func _make_world_snapshot() -> Dictionary:
 			"pickup_radius": active_player.pickup_radius,
 			"aim_direction": active_player.aim_direction,
 			"body_color": active_player.body_color,
+			"weapon_status": _ensure_player_loadout(int(peer_id)).status_text(),
 			"downed": active_player.downed,
 			"revive_progress": active_player.revive_progress,
 			"down_count": active_player.down_count
@@ -1990,8 +2182,10 @@ func _make_world_snapshot() -> Dictionary:
 		"protocol_version": NetworkSessionResource.PROTOCOL_VERSION,
 		"host_network_state": network_state,
 		"run_started": run_started,
+		"lobby_auto_start_timer": lobby_auto_start_timer,
 		"lobby_ready": _serialize_lobby_ready(),
 		"waiting_peer_ids": _serialize_waiting_peer_ids(),
+		"run_participant_peer_ids": _serialize_run_participant_peer_ids(),
 		"elapsed": elapsed,
 		"kills": kills,
 		"level": level,
@@ -1999,9 +2193,11 @@ func _make_world_snapshot() -> Dictionary:
 		"xp_to_next": xp_to_next,
 		"game_over": game_over,
 		"choosing_upgrade": choosing_upgrade,
-		"upgrade_title": upgrade_title_label.text if upgrade_title_label != null else "",
-		"upgrade_hint": upgrade_hint_label.text if upgrade_hint_label != null else "",
-		"upgrade_choices": upgrade_choices,
+		"upgrade_reward_source": upgrade_reward_source,
+		"upgrade_title": _upgrade_title_for_source(upgrade_reward_source),
+		"upgrade_hint": _upgrade_hint_for_source(upgrade_reward_source),
+		"upgrade_choices_by_peer": _serialize_upgrade_choices_by_peer(),
+		"upgrade_selected_peer_ids": _serialize_upgrade_selected_peer_ids(),
 		"wave_index": spawn_director.wave_index,
 		"players": players_data,
 		"zombies": zombies_data,
@@ -2010,7 +2206,7 @@ func _make_world_snapshot() -> Dictionary:
 		"reward_chests": chests_data,
 		"supply_caches": supplies_data,
 		"holdout_events": holdouts_data,
-		"weapon_status": weapon_loadout.status_text(),
+		"weapon_status": _local_weapon_status_text(),
 		"relic_status": relics.status_text(),
 		"game_over_text": game_over_label.text if game_over_label != null else ""
 	}
@@ -2020,17 +2216,25 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 	snapshot_debug["last_size"] = str(snapshot).to_utf8_buffer().size()
 	snapshot_debug["last_received_msec"] = Time.get_ticks_msec()
 	snapshot_debug["received_count"] = int(snapshot_debug.get("received_count", 0)) + 1
+	var was_game_over := game_over
 	local_peer_id = network_session.local_peer_id() if network_session != null else local_peer_id
 	run_started = bool(snapshot.get("run_started", run_started))
+	lobby_auto_start_timer = float(snapshot.get("lobby_auto_start_timer", lobby_auto_start_timer))
 	_apply_lobby_ready_snapshot(snapshot.get("lobby_ready", {}))
 	_apply_waiting_peer_ids_snapshot(snapshot.get("waiting_peer_ids", []))
+	_apply_run_participant_peer_ids_snapshot(snapshot.get("run_participant_peer_ids", []))
 	elapsed = float(snapshot.get("elapsed", elapsed))
 	kills = int(snapshot.get("kills", kills))
 	level = int(snapshot.get("level", level))
 	xp = int(snapshot.get("xp", xp))
 	xp_to_next = int(snapshot.get("xp_to_next", xp_to_next))
 	game_over = bool(snapshot.get("game_over", false))
+	if not game_over:
+		local_run_recorded = false
 	choosing_upgrade = bool(snapshot.get("choosing_upgrade", false))
+	upgrade_reward_source = String(snapshot.get("upgrade_reward_source", upgrade_reward_source))
+	_apply_upgrade_choices_by_peer_snapshot(snapshot.get("upgrade_choices_by_peer", {}))
+	_apply_upgrade_selected_peer_ids_snapshot(snapshot.get("upgrade_selected_peer_ids", []))
 	spawn_director.wave_index = int(snapshot.get("wave_index", spawn_director.wave_index))
 	synced_weapon_status_text = String(snapshot.get("weapon_status", synced_weapon_status_text))
 	synced_relic_status_text = String(snapshot.get("relic_status", synced_relic_status_text))
@@ -2053,6 +2257,8 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		synced_player.revive_progress = float(player_data.get("revive_progress", synced_player.revive_progress))
 		synced_player.down_count = int(player_data.get("down_count", synced_player.down_count))
 		synced_player.set_display_color(player_data.get("body_color", synced_player.body_color))
+		if peer_id == local_peer_id:
+			synced_weapon_status_text = String(player_data.get("weapon_status", synced_weapon_status_text))
 		active_peer_ids[peer_id] = true
 
 	for peer_id in players.keys().duplicate():
@@ -2124,19 +2330,19 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		network_status_label.text = "本局进行中：观战中，下一局加入"
 	elif network_status_label != null and _is_network_client():
 		network_status_label.text = "局内：已连接房主"
-	if choosing_upgrade:
-		_show_synced_upgrade_choices(
-			String(snapshot.get("upgrade_title", "选择一个变异强化")),
-			String(snapshot.get("upgrade_hint", "按 1/2/3 或点击按钮")),
-			snapshot.get("upgrade_choices", [])
-		)
+	if choosing_upgrade and _has_local_active_player():
+		_show_current_local_upgrade_choices()
 	else:
 		upgrade_overlay.visible = false
 		upgrade_choices.clear()
 		synced_upgrade_choice_key = ""
 	game_over_overlay.visible = game_over
 	if game_over and game_over_label != null:
-		game_over_label.text = String(snapshot.get("game_over_text", "游戏结束"))
+		_record_synced_run_if_needed(was_game_over)
+		if _is_peer_participant(local_peer_id):
+			_update_game_over_label()
+		else:
+			game_over_label.text = String(snapshot.get("game_over_text", "游戏结束")) + "\n\n你是观战玩家，本局不结算局外进度。"
 	_update_hud()
 
 
@@ -2278,26 +2484,54 @@ func _update_hud() -> void:
 	hp_bar.value = status_player.hp
 	xp_bar.max_value = xp_to_next
 	xp_bar.value = xp
-	var weapon_text := synced_weapon_status_text if _is_network_client() and not synced_weapon_status_text.is_empty() else weapon_loadout.status_text()
+	var weapon_text := _local_weapon_status_text()
 	var relic_text := synced_relic_status_text if _is_network_client() and not synced_relic_status_text.is_empty() else relics.status_text()
 	weapon_label.text = "武器 %s" % weapon_text
 	relic_label.text = "遗物 %s" % relic_text
 
 
+func _local_weapon_status_text() -> String:
+	if _is_network_client() and not synced_weapon_status_text.is_empty():
+		return synced_weapon_status_text
+	if player_weapon_loadouts.has(local_peer_id):
+		return player_weapon_loadouts[local_peer_id].status_text()
+	return weapon_loadout.status_text()
+
+
 func _end_game() -> void:
 	game_over = true
-	last_unlock_messages = meta_progression.record_run(elapsed, kills)
-	selected_starting_weapon = meta_progression.coerce_starting_weapon(selected_starting_weapon)
-	selected_character = meta_progression.coerce_character(selected_character)
+	_record_local_run_if_needed()
 	_update_game_over_label()
 	game_over_overlay.visible = true
 	_broadcast_world_snapshot_now()
 
 
+func _record_synced_run_if_needed(was_game_over: bool) -> void:
+	if was_game_over:
+		return
+	_record_local_run_if_needed()
+
+
+func _record_local_run_if_needed() -> void:
+	if local_run_recorded:
+		return
+	if not _is_peer_participant(local_peer_id):
+		last_unlock_messages.clear()
+		return
+	last_unlock_messages = meta_progression.record_run(elapsed, kills)
+	local_run_recorded = true
+	selected_starting_weapon = meta_progression.coerce_starting_weapon(selected_starting_weapon)
+	selected_character = meta_progression.coerce_character(selected_character)
+
+
 func _restart_game() -> void:
 	if players.is_empty():
 		_ensure_player(SERVER_PEER_ID)
+	if run_participant_peer_ids.is_empty():
+		_set_run_participants_from_current_players()
+	local_run_recorded = false
 	player_weapon_loadouts.clear()
+	player_upgrade_states.clear()
 	weapon_loadout.reset(selected_starting_weapon)
 	for peer_id in players.keys():
 		var active_player := players[peer_id] as Player
@@ -2308,6 +2542,7 @@ func _restart_game() -> void:
 		var loadout := WeaponLoadout.new()
 		loadout.reset(selected_starting_weapon)
 		player_weapon_loadouts[int(peer_id)] = loadout
+		player_upgrade_states[int(peer_id)] = UpgradeState.new()
 	_refresh_player_identity_markers()
 	zombies.clear()
 	bullets.clear()
@@ -2317,12 +2552,14 @@ func _restart_game() -> void:
 	holdout_events.clear()
 	visual_effects.clear()
 	upgrade_choices.clear()
+	upgrade_choices_by_peer.clear()
+	upgrade_selected_peer_ids.clear()
+	upgrade_reward_source = UpgradeCatalog.REWARD_LEVEL
 	zombie_grid.clear()
 	spawn_director.reset()
 	elite_director.reset()
 	map_event_director.reset()
 	weapon_loadout.reset(selected_starting_weapon)
-	upgrade_state.reset()
 	relics.reset()
 	hud_refresh_timer = 0.0
 	network_input_timer = 0.0

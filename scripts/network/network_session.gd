@@ -19,7 +19,9 @@ const MODE_CONNECTING := "connecting"
 const DEFAULT_PORT := 24567
 const MAX_PLAYERS := 4
 const SERVER_PEER_ID := 1
-const PROTOCOL_VERSION := 1
+const PROTOCOL_VERSION := 2
+const MAX_UPGRADE_CHOICE_INDEX := 8
+const MAX_MOUSE_TARGET_ABS := 100000.0
 
 var mode := MODE_OFFLINE
 var status_text := "单人模式"
@@ -95,13 +97,16 @@ func local_peer_id() -> int:
 
 
 func send_player_input(input_state: Dictionary) -> void:
+	var sanitized_input := _sanitize_input_state(input_state)
 	if mode == MODE_CLIENT:
-		_submit_player_input.rpc_id(SERVER_PEER_ID, input_state)
+		_submit_player_input.rpc_id(SERVER_PEER_ID, sanitized_input)
 	elif mode == MODE_HOST or mode == MODE_OFFLINE:
-		latest_inputs[SERVER_PEER_ID] = input_state
+		latest_inputs[SERVER_PEER_ID] = sanitized_input
 
 
 func send_upgrade_choice(choice_index: int) -> void:
+	if not _is_valid_upgrade_choice_index(choice_index):
+		return
 	if mode == MODE_CLIENT:
 		_submit_upgrade_choice.rpc_id(SERVER_PEER_ID, choice_index)
 	elif mode == MODE_HOST or mode == MODE_OFFLINE:
@@ -154,9 +159,11 @@ func _submit_player_input(input_state: Dictionary) -> void:
 	var sender_id := multiplayer.get_remote_sender_id()
 	if sender_id <= 0:
 		return
+	if not _is_verified_peer(sender_id):
+		return
 	if not latest_inputs.has(sender_id):
 		return
-	latest_inputs[sender_id] = input_state
+	latest_inputs[sender_id] = _sanitize_input_state(input_state)
 
 
 @rpc("any_peer", "reliable")
@@ -167,6 +174,8 @@ func _submit_upgrade_choice(choice_index: int) -> void:
 	if sender_id <= 0:
 		return
 	if not _is_verified_peer(sender_id):
+		return
+	if not _is_valid_upgrade_choice_index(choice_index):
 		return
 	upgrade_choice_received.emit(sender_id, choice_index)
 
@@ -281,3 +290,40 @@ func _close_peer() -> void:
 
 func _is_verified_peer(peer_id: int) -> bool:
 	return peer_id == SERVER_PEER_ID or peer_protocol_versions.has(peer_id)
+
+
+func _is_valid_upgrade_choice_index(choice_index: int) -> bool:
+	return choice_index >= 0 and choice_index <= MAX_UPGRADE_CHOICE_INDEX
+
+
+func _sanitize_input_state(input_state: Dictionary) -> Dictionary:
+	var movement := Vector2.ZERO
+	var raw_movement = input_state.get("movement", Vector2.ZERO)
+	if raw_movement is Vector2:
+		movement = raw_movement
+	if not _is_valid_vector2(movement):
+		movement = Vector2.ZERO
+	if movement.length_squared() > 1.0:
+		movement = movement.normalized()
+
+	var mouse_target := Vector2.ZERO
+	var raw_mouse_target = input_state.get("mouse_target", Vector2.ZERO)
+	if raw_mouse_target is Vector2:
+		mouse_target = raw_mouse_target
+	if not _is_valid_vector2(mouse_target):
+		mouse_target = Vector2.ZERO
+
+	return {
+		"movement": movement,
+		"updates_mouse_target": bool(input_state.get("updates_mouse_target", false)),
+		"mouse_target": mouse_target
+	}
+
+
+func _is_valid_vector2(value: Vector2) -> bool:
+	return (
+		value.x == value.x
+		and value.y == value.y
+		and absf(value.x) <= MAX_MOUSE_TARGET_ABS
+		and absf(value.y) <= MAX_MOUSE_TARGET_ABS
+	)
