@@ -91,7 +91,9 @@ var lobby_start_button: Button
 var lobby_single_button: Button
 var lobby_host_button: Button
 var lobby_join_button: Button
+var lobby_discovery_button: Button
 var lobby_leave_button: Button
+var lobby_discovery_label: Label
 var hp_bar: ProgressBar
 var xp_bar: ProgressBar
 var upgrade_overlay: ColorRect
@@ -175,6 +177,7 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	_update_feedback_audio(delta)
 	_refresh_network_state()
+	_update_room_advertisement_state()
 	_update_debug_overlay()
 	if _is_lobby_state():
 		_update_lobby_network(delta)
@@ -1128,7 +1131,7 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_overlay.add_child(center)
 
 	var panel := PanelContainer.new()
-	panel.custom_minimum_size = Vector2(560.0, 500.0)
+	panel.custom_minimum_size = Vector2(580.0, 545.0)
 	center.add_child(panel)
 
 	var margin := MarginContainer.new()
@@ -1190,10 +1193,21 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_join_button.pressed.connect(_join_lan_game)
 	network_row.add_child(lobby_join_button)
 
+	lobby_discovery_button = Button.new()
+	lobby_discovery_button.text = "搜索房间"
+	lobby_discovery_button.pressed.connect(_search_lan_rooms)
+	network_row.add_child(lobby_discovery_button)
+
 	lobby_leave_button = Button.new()
 	lobby_leave_button.text = "退出房间"
 	lobby_leave_button.pressed.connect(_use_offline_mode)
 	network_row.add_child(lobby_leave_button)
+
+	lobby_discovery_label = Label.new()
+	lobby_discovery_label.text = "未搜索房间"
+	lobby_discovery_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lobby_discovery_label.custom_minimum_size = Vector2(500.0, 44.0)
+	box.add_child(lobby_discovery_label)
 
 	var ready_row := HBoxContainer.new()
 	ready_row.add_theme_constant_override("separation", 8)
@@ -1230,6 +1244,7 @@ func _setup_network_session() -> void:
 	network_session.game_start_received.connect(_on_network_game_start_received)
 	network_session.protocol_accepted.connect(_on_network_protocol_accepted)
 	network_session.protocol_rejected.connect(_on_network_protocol_rejected)
+	network_session.discovered_rooms_changed.connect(_on_discovered_rooms_changed)
 
 
 func _setup_player() -> void:
@@ -1289,6 +1304,13 @@ func _can_submit_game_input() -> bool:
 
 func _has_local_active_player() -> bool:
 	return players.has(local_peer_id) and not waiting_peer_ids.has(local_peer_id)
+
+
+func _update_room_advertisement_state() -> void:
+	if network_session == null or not network_session.is_host():
+		return
+	var room_state := "running" if run_started else "lobby"
+	network_session.update_room_advertisement(room_state, players.size())
 
 
 func _is_peer_active_in_current_run(peer_id: int) -> bool:
@@ -1946,6 +1968,63 @@ func _is_private_lan_ipv4(address: String) -> bool:
 	return second_octet >= 16 and second_octet <= 31
 
 
+func _search_lan_rooms() -> void:
+	if network_session == null:
+		return
+	var error: Error = network_session.start_room_discovery()
+	if error != OK:
+		if lobby_discovery_label != null:
+			lobby_discovery_label.text = "搜索失败：UDP 端口 %d 不可用（错误 %s）" % [NetworkSessionResource.DISCOVERY_PORT, error]
+		return
+	_apply_first_discovered_room_to_inputs()
+	_update_discovery_ui()
+
+
+func _on_discovered_rooms_changed() -> void:
+	_apply_first_discovered_room_to_inputs()
+	_update_discovery_ui()
+
+
+func _apply_first_discovered_room_to_inputs() -> void:
+	if network_session == null:
+		return
+	var room: Dictionary = network_session.first_discovered_room()
+	if room.is_empty():
+		return
+	if network_ip_input != null:
+		network_ip_input.text = String(room.get("address", network_ip_input.text))
+	if network_port_spin_box != null:
+		network_port_spin_box.value = int(room.get("port", NetworkSessionResource.DEFAULT_PORT))
+
+
+func _update_discovery_ui() -> void:
+	if lobby_discovery_label == null or network_session == null:
+		return
+	var rooms: Array = network_session.discovered_room_list()
+	if rooms.is_empty():
+		if network_session.is_room_discovery_active():
+			lobby_discovery_label.text = "正在搜索局域网房间..."
+		else:
+			lobby_discovery_label.text = "未搜索房间"
+		return
+	var lines := ["发现房间"]
+	for room in rooms:
+		var state_text := _room_state_text(String(room.get("room_state", "lobby")))
+		lines.append("%s:%d  %s  %d/%d" % [
+			String(room.get("address", "")),
+			int(room.get("port", NetworkSessionResource.DEFAULT_PORT)),
+			state_text,
+			int(room.get("player_count", 1)),
+			int(room.get("max_players", NetworkSessionResource.MAX_PLAYERS))
+		])
+	lines.append("已自动填入第一个房间，点击加入。")
+	lobby_discovery_label.text = "\n".join(lines)
+
+
+func _room_state_text(room_state: String) -> String:
+	return "游戏中" if room_state == "running" else "大厅"
+
+
 func _update_lobby_ui() -> void:
 	if lobby_overlay == null:
 		return
@@ -1970,8 +2049,14 @@ func _update_lobby_ui() -> void:
 		lobby_host_button.disabled = in_network_session
 	if lobby_join_button != null:
 		lobby_join_button.disabled = in_network_session
+	if lobby_discovery_button != null:
+		lobby_discovery_button.disabled = in_network_session
+		lobby_discovery_button.text = "刷新房间" if network_session != null and network_session.is_room_discovery_active() else "搜索房间"
 	if lobby_leave_button != null:
 		lobby_leave_button.visible = in_network_session
+	if lobby_discovery_label != null:
+		lobby_discovery_label.visible = not in_network_session
+		_update_discovery_ui()
 	if lobby_players_label != null:
 		lobby_players_label.text = _lobby_players_text()
 	if network_status_label != null:
@@ -1987,7 +2072,7 @@ func _lobby_status_text(is_host: bool, is_client: bool) -> String:
 	if is_host:
 		if lobby_auto_start_timer >= 0.0:
 			return "全员已准备，%.1f 秒后自动开始。" % maxf(lobby_auto_start_timer, 0.0)
-		return "房间 IP %s  端口 %d，所有玩家准备后自动开始。" % [_lan_address_hint(), int(network_port_spin_box.value)]
+		return "房间 IP %s  端口 %d，已广播房间，所有玩家准备后自动开始。" % [_lan_address_hint(), int(network_port_spin_box.value)]
 	if is_client:
 		if lobby_auto_start_timer >= 0.0:
 			return "全员已准备，等待房主自动开局 %.1f 秒。" % maxf(lobby_auto_start_timer, 0.0)

@@ -11,15 +11,21 @@ signal lobby_ready_received(peer_id: int, is_ready: bool)
 signal game_start_received()
 signal protocol_accepted()
 signal protocol_rejected(reason: String)
+signal discovered_rooms_changed()
 
 const MODE_OFFLINE := "offline"
 const MODE_HOST := "host"
 const MODE_CLIENT := "client"
 const MODE_CONNECTING := "connecting"
 const DEFAULT_PORT := 24567
+const DISCOVERY_PORT := 24568
+const DISCOVERY_MAGIC := "ROGUELITE_RPG_LAN_ROOM"
+const DISCOVERY_BROADCAST_ADDRESS := "255.255.255.255"
+const DISCOVERY_INTERVAL := 1.0
+const DISCOVERY_ROOM_TIMEOUT := 3.5
 const MAX_PLAYERS := 4
 const SERVER_PEER_ID := 1
-const PROTOCOL_VERSION := 3
+const PROTOCOL_VERSION := 4
 const MAX_UPGRADE_CHOICE_INDEX := 8
 const MAX_MOUSE_TARGET_ABS := 100000.0
 
@@ -29,6 +35,13 @@ var latest_inputs := {}
 var latest_world_snapshot := {}
 var pending_protocol_peers := {}
 var peer_protocol_versions := {}
+var discovery_sender: PacketPeerUDP
+var discovery_listener: PacketPeerUDP
+var discovery_broadcast_timer := 0.0
+var discovery_game_port := DEFAULT_PORT
+var discovery_room_state := "lobby"
+var discovery_player_count := 1
+var discovered_rooms := {}
 
 
 func _ready() -> void:
@@ -39,8 +52,14 @@ func _ready() -> void:
 	multiplayer.server_disconnected.connect(_on_server_disconnected)
 
 
+func _process(delta: float) -> void:
+	_update_room_advertising(delta)
+	_poll_room_discovery()
+
+
 func host_game(port := DEFAULT_PORT) -> Error:
 	_close_peer()
+	stop_room_discovery()
 	var peer := ENetMultiplayerPeer.new()
 	var error := peer.create_server(port, MAX_PLAYERS - 1)
 	if error != OK:
@@ -53,12 +72,15 @@ func host_game(port := DEFAULT_PORT) -> Error:
 	latest_inputs[SERVER_PEER_ID] = {}
 	peer_protocol_versions[SERVER_PEER_ID] = PROTOCOL_VERSION
 	_set_mode(MODE_HOST, "房主模式，端口 %d" % port)
+	start_room_advertising(port)
 	peer_joined.emit(SERVER_PEER_ID)
 	return OK
 
 
 func join_game(address: String, port := DEFAULT_PORT) -> Error:
 	_close_peer()
+	stop_room_advertising()
+	stop_room_discovery()
 	var peer := ENetMultiplayerPeer.new()
 	var error := peer.create_client(address, port)
 	if error != OK:
@@ -71,6 +93,7 @@ func join_game(address: String, port := DEFAULT_PORT) -> Error:
 
 func use_offline_mode() -> void:
 	_close_peer()
+	stop_room_advertising()
 	latest_inputs.clear()
 	latest_world_snapshot.clear()
 	pending_protocol_peers.clear()
@@ -150,6 +173,63 @@ func connected_peer_ids() -> Array[int]:
 	for peer_id in multiplayer.get_peers():
 		peer_ids.append(int(peer_id))
 	return peer_ids
+
+
+func start_room_advertising(game_port := DEFAULT_PORT) -> void:
+	stop_room_advertising()
+	discovery_game_port = game_port
+	discovery_sender = PacketPeerUDP.new()
+	discovery_sender.set_broadcast_enabled(true)
+	discovery_sender.set_dest_address(DISCOVERY_BROADCAST_ADDRESS, DISCOVERY_PORT)
+	discovery_broadcast_timer = 0.0
+
+
+func stop_room_advertising() -> void:
+	if discovery_sender != null:
+		discovery_sender.close()
+	discovery_sender = null
+
+
+func update_room_advertisement(room_state: String, player_count: int) -> void:
+	discovery_room_state = room_state
+	discovery_player_count = clampi(player_count, 1, MAX_PLAYERS)
+
+
+func start_room_discovery() -> Error:
+	if discovery_listener != null and discovery_listener.is_bound():
+		return OK
+	discovered_rooms.clear()
+	discovery_listener = PacketPeerUDP.new()
+	var error := discovery_listener.bind(DISCOVERY_PORT)
+	if error != OK:
+		discovery_listener = null
+		return error
+	discovered_rooms_changed.emit()
+	return OK
+
+
+func stop_room_discovery() -> void:
+	if discovery_listener != null:
+		discovery_listener.close()
+	discovery_listener = null
+
+
+func is_room_discovery_active() -> bool:
+	return discovery_listener != null and discovery_listener.is_bound()
+
+
+func discovered_room_list() -> Array:
+	_prune_discovered_rooms()
+	var rooms := []
+	for room_key in discovered_rooms.keys():
+		rooms.append(discovered_rooms[room_key])
+	rooms.sort_custom(func(a, b): return String(a.get("address", "")) < String(b.get("address", "")))
+	return rooms
+
+
+func first_discovered_room() -> Dictionary:
+	var rooms := discovered_room_list()
+	return rooms[0] if not rooms.is_empty() else {}
 
 
 @rpc("any_peer", "unreliable")
@@ -286,6 +366,67 @@ func _close_peer() -> void:
 	if multiplayer.multiplayer_peer != null:
 		multiplayer.multiplayer_peer.close()
 	multiplayer.multiplayer_peer = null
+
+
+func _update_room_advertising(delta: float) -> void:
+	if mode != MODE_HOST or discovery_sender == null:
+		return
+	discovery_broadcast_timer -= delta
+	if discovery_broadcast_timer > 0.0:
+		return
+	discovery_broadcast_timer = DISCOVERY_INTERVAL
+	var payload := {
+		"magic": DISCOVERY_MAGIC,
+		"protocol_version": PROTOCOL_VERSION,
+		"game_port": discovery_game_port,
+		"room_state": discovery_room_state,
+		"player_count": discovery_player_count,
+		"max_players": MAX_PLAYERS
+	}
+	discovery_sender.put_packet(JSON.stringify(payload).to_utf8_buffer())
+
+
+func _poll_room_discovery() -> void:
+	if discovery_listener == null or not discovery_listener.is_bound():
+		return
+	var changed := false
+	while discovery_listener.get_available_packet_count() > 0:
+		var packet := discovery_listener.get_packet()
+		var data = JSON.parse_string(packet.get_string_from_utf8())
+		if not (data is Dictionary):
+			continue
+		if String(data.get("magic", "")) != DISCOVERY_MAGIC:
+			continue
+		if int(data.get("protocol_version", -1)) != PROTOCOL_VERSION:
+			continue
+		var address := discovery_listener.get_packet_ip()
+		var game_port := int(data.get("game_port", DEFAULT_PORT))
+		var room_key := "%s:%d" % [address, game_port]
+		discovered_rooms[room_key] = {
+			"address": address,
+			"port": game_port,
+			"room_state": String(data.get("room_state", "lobby")),
+			"player_count": int(data.get("player_count", 1)),
+			"max_players": int(data.get("max_players", MAX_PLAYERS)),
+			"protocol_version": int(data.get("protocol_version", PROTOCOL_VERSION)),
+			"last_seen_msec": Time.get_ticks_msec()
+		}
+		changed = true
+	if _prune_discovered_rooms():
+		changed = true
+	if changed:
+		discovered_rooms_changed.emit()
+
+
+func _prune_discovered_rooms() -> bool:
+	var now := Time.get_ticks_msec()
+	var changed := false
+	for room_key in discovered_rooms.keys().duplicate():
+		var room: Dictionary = discovered_rooms[room_key]
+		if now - int(room.get("last_seen_msec", 0)) > int(DISCOVERY_ROOM_TIMEOUT * 1000.0):
+			discovered_rooms.erase(room_key)
+			changed = true
+	return changed
 
 
 func _is_verified_peer(peer_id: int) -> bool:
