@@ -19,9 +19,12 @@ const MODE_CLIENT := "client"
 const MODE_CONNECTING := "connecting"
 const DEFAULT_PORT := 24567
 const DISCOVERY_PORT := 24568
+const DISCOVERY_REQUEST_PORT := 24569
 const DISCOVERY_MAGIC := "ROGUELITE_RPG_LAN_ROOM"
+const DISCOVERY_QUERY_MAGIC := "ROGUELITE_RPG_LAN_QUERY"
 const DISCOVERY_BROADCAST_ADDRESS := "255.255.255.255"
 const DISCOVERY_INTERVAL := 1.0
+const DISCOVERY_PROBE_INTERVAL := 0.8
 const DISCOVERY_ROOM_TIMEOUT := 3.5
 const MAX_PLAYERS := 15
 const SERVER_PEER_ID := 1
@@ -36,8 +39,11 @@ var latest_world_snapshot := {}
 var pending_protocol_peers := {}
 var peer_protocol_versions := {}
 var discovery_sender: PacketPeerUDP
+var discovery_request_listener: PacketPeerUDP
 var discovery_listener: PacketPeerUDP
+var discovery_probe_sender: PacketPeerUDP
 var discovery_broadcast_timer := 0.0
+var discovery_probe_timer := 0.0
 var discovery_game_port := DEFAULT_PORT
 var discovery_room_name := "RPG 房间"
 var discovery_room_state := "lobby"
@@ -55,6 +61,8 @@ func _ready() -> void:
 
 func _process(delta: float) -> void:
 	_update_room_advertising(delta)
+	_poll_room_discovery_requests()
+	_update_room_discovery_probe(delta)
 	_poll_room_discovery()
 
 
@@ -181,7 +189,10 @@ func start_room_advertising(game_port := DEFAULT_PORT) -> void:
 	discovery_game_port = game_port
 	discovery_sender = PacketPeerUDP.new()
 	discovery_sender.set_broadcast_enabled(true)
-	discovery_sender.set_dest_address(DISCOVERY_BROADCAST_ADDRESS, DISCOVERY_PORT)
+	discovery_request_listener = PacketPeerUDP.new()
+	var request_error := discovery_request_listener.bind(DISCOVERY_REQUEST_PORT)
+	if request_error != OK:
+		discovery_request_listener = null
 	discovery_broadcast_timer = 0.0
 
 
@@ -189,6 +200,9 @@ func stop_room_advertising() -> void:
 	if discovery_sender != null:
 		discovery_sender.close()
 	discovery_sender = null
+	if discovery_request_listener != null:
+		discovery_request_listener.close()
+	discovery_request_listener = null
 
 
 func update_room_advertisement(room_state: String, player_count: int, room_name := "") -> void:
@@ -207,6 +221,9 @@ func start_room_discovery() -> Error:
 	if error != OK:
 		discovery_listener = null
 		return error
+	discovery_probe_sender = PacketPeerUDP.new()
+	discovery_probe_sender.set_broadcast_enabled(true)
+	discovery_probe_timer = 0.0
 	discovered_rooms_changed.emit()
 	return OK
 
@@ -215,6 +232,9 @@ func stop_room_discovery() -> void:
 	if discovery_listener != null:
 		discovery_listener.close()
 	discovery_listener = null
+	if discovery_probe_sender != null:
+		discovery_probe_sender.close()
+	discovery_probe_sender = null
 
 
 func is_room_discovery_active() -> bool:
@@ -378,6 +398,13 @@ func _update_room_advertising(delta: float) -> void:
 	if discovery_broadcast_timer > 0.0:
 		return
 	discovery_broadcast_timer = DISCOVERY_INTERVAL
+	for address in _discovery_broadcast_addresses():
+		_send_room_advertisement(String(address), DISCOVERY_PORT)
+
+
+func _send_room_advertisement(address: String, port: int) -> void:
+	if discovery_sender == null:
+		return
 	var payload := {
 		"magic": DISCOVERY_MAGIC,
 		"protocol_version": PROTOCOL_VERSION,
@@ -387,7 +414,50 @@ func _update_room_advertising(delta: float) -> void:
 		"player_count": discovery_player_count,
 		"max_players": MAX_PLAYERS
 	}
+	discovery_sender.set_dest_address(address, port)
 	discovery_sender.put_packet(JSON.stringify(payload).to_utf8_buffer())
+
+
+func _poll_room_discovery_requests() -> void:
+	if mode != MODE_HOST or discovery_request_listener == null or not discovery_request_listener.is_bound():
+		return
+	while discovery_request_listener.get_available_packet_count() > 0:
+		var packet := discovery_request_listener.get_packet()
+		var data = JSON.parse_string(packet.get_string_from_utf8())
+		if not (data is Dictionary):
+			continue
+		if String(data.get("magic", "")) != DISCOVERY_QUERY_MAGIC:
+			continue
+		if int(data.get("protocol_version", -1)) != PROTOCOL_VERSION:
+			continue
+		var reply_port := int(data.get("reply_port", DISCOVERY_PORT))
+		if reply_port <= 0 or reply_port > 65535:
+			continue
+		_send_room_advertisement(discovery_request_listener.get_packet_ip(), reply_port)
+
+
+func _update_room_discovery_probe(delta: float) -> void:
+	if discovery_listener == null or not discovery_listener.is_bound() or discovery_probe_sender == null:
+		return
+	discovery_probe_timer -= delta
+	if discovery_probe_timer > 0.0:
+		return
+	discovery_probe_timer = DISCOVERY_PROBE_INTERVAL
+	_send_room_discovery_probe()
+
+
+func _send_room_discovery_probe() -> void:
+	if discovery_probe_sender == null:
+		return
+	var payload := {
+		"magic": DISCOVERY_QUERY_MAGIC,
+		"protocol_version": PROTOCOL_VERSION,
+		"reply_port": DISCOVERY_PORT
+	}
+	var packet := JSON.stringify(payload).to_utf8_buffer()
+	for address in _discovery_broadcast_addresses():
+		discovery_probe_sender.set_dest_address(String(address), DISCOVERY_REQUEST_PORT)
+		discovery_probe_sender.put_packet(packet)
 
 
 func _poll_room_discovery() -> void:
@@ -432,6 +502,57 @@ func _prune_discovered_rooms() -> bool:
 			discovered_rooms.erase(room_key)
 			changed = true
 	return changed
+
+
+func _discovery_broadcast_addresses() -> Array:
+	var addresses := [DISCOVERY_BROADCAST_ADDRESS]
+	var seen := {DISCOVERY_BROADCAST_ADDRESS: true}
+	for raw_address in IP.get_local_addresses():
+		var address := String(raw_address)
+		if not _is_private_ipv4_for_discovery(address):
+			continue
+		var broadcast_address := _directed_broadcast_address(address)
+		if broadcast_address.is_empty() or seen.has(broadcast_address):
+			continue
+		addresses.append(broadcast_address)
+		seen[broadcast_address] = true
+	return addresses
+
+
+func _is_private_ipv4_for_discovery(address: String) -> bool:
+	var octets := _ipv4_octets(address)
+	if octets.is_empty():
+		return false
+	var first := int(octets[0])
+	var second := int(octets[1])
+	if first == 10 or (first == 192 and second == 168):
+		return true
+	if first == 172 and second >= 16 and second <= 31:
+		return true
+	return first == 169 and second == 254
+
+
+func _directed_broadcast_address(address: String) -> String:
+	var octets := _ipv4_octets(address)
+	if octets.is_empty():
+		return ""
+	return "%d.%d.%d.255" % [int(octets[0]), int(octets[1]), int(octets[2])]
+
+
+func _ipv4_octets(address: String) -> Array:
+	var parts := address.split(".")
+	if parts.size() != 4:
+		return []
+	var octets := []
+	for part in parts:
+		var text := String(part)
+		if not text.is_valid_int():
+			return []
+		var value := int(text)
+		if value < 0 or value > 255:
+			return []
+		octets.append(value)
+	return octets
 
 
 func _is_verified_peer(peer_id: int) -> bool:

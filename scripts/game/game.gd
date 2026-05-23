@@ -85,6 +85,7 @@ var hud_layer: CanvasLayer
 var hud_label: Label
 var weapon_label: Label
 var relic_label: Label
+var status_hint_label: Label
 var network_session
 var network_status_label: Label
 var debug_label: Label
@@ -299,6 +300,7 @@ func _draw() -> void:
 	for effect: VisualEffectState in visual_effects.effects:
 		if draw_rect.has_point(effect.position):
 			_draw_visual_effect(effect)
+	_draw_revive_indicators(draw_rect)
 	for bullet: BulletState in bullets:
 		if draw_rect.has_point(bullet.position):
 			draw_circle(bullet.position, bullet.radius, bullet.color)
@@ -306,6 +308,37 @@ func _draw() -> void:
 		if not draw_rect.has_point(zombie.position):
 			continue
 		_draw_zombie(zombie, draw_zombie_details)
+
+
+func _draw_revive_indicators(draw_rect: Rect2) -> void:
+	if not run_started:
+		return
+	var local_player := players.get(local_peer_id) as Player
+	for peer_id in players.keys():
+		var peer_int := int(peer_id)
+		if waiting_peer_ids.has(peer_int):
+			continue
+		var downed_player := players[peer_id] as Player
+		if downed_player == null or not downed_player.downed:
+			continue
+		if not draw_rect.grow(REVIVE_RADIUS + 12.0).has_point(downed_player.position):
+			continue
+		var has_reviver := _has_reviver_nearby(downed_player)
+		var range_color := Color(0.26, 0.95, 0.58, 0.34) if has_reviver else Color(0.95, 0.38, 0.28, 0.28)
+		draw_circle(downed_player.position, REVIVE_RADIUS, Color(range_color.r, range_color.g, range_color.b, 0.055))
+		draw_arc(downed_player.position, REVIVE_RADIUS, 0.0, TAU, 72, range_color, 2.5)
+		draw_arc(
+			downed_player.position,
+			REVIVE_RADIUS + 5.0,
+			-PI * 0.5,
+			-PI * 0.5 + TAU * clampf(downed_player.revive_progress, 0.0, 1.0),
+			72,
+			Color(0.42, 1.0, 0.68, 0.88),
+			4.0
+		)
+		if local_player != null and local_player.is_combat_active() and local_player != downed_player:
+			if local_player.position.distance_squared_to(downed_player.position) <= REVIVE_RADIUS_SQ:
+				draw_line(local_player.position, downed_player.position, Color(0.42, 1.0, 0.68, 0.55), 2.0)
 
 
 func _update_players(delta: float) -> void:
@@ -1046,6 +1079,23 @@ func _create_ui() -> void:
 	relic_label.add_theme_color_override("font_color", Color(0.88, 0.8, 0.95))
 	relic_label.add_theme_font_size_override("font_size", 14)
 	root.add_child(relic_label)
+
+	status_hint_label = Label.new()
+	status_hint_label.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+	status_hint_label.offset_left = 260.0
+	status_hint_label.offset_right = -260.0
+	status_hint_label.offset_top = -74.0
+	status_hint_label.offset_bottom = -38.0
+	status_hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	status_hint_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	status_hint_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	status_hint_label.add_theme_font_size_override("font_size", 18)
+	status_hint_label.add_theme_color_override("font_color", Color(0.94, 0.98, 0.88))
+	status_hint_label.add_theme_color_override("font_shadow_color", Color(0.0, 0.0, 0.0, 0.9))
+	status_hint_label.add_theme_constant_override("shadow_offset_x", 2)
+	status_hint_label.add_theme_constant_override("shadow_offset_y", 2)
+	status_hint_label.visible = false
+	root.add_child(status_hint_label)
 
 	network_status_label = Label.new()
 	network_status_label.position = Vector2(930.0, 18.0)
@@ -1944,6 +1994,48 @@ func _revive_required_time(downed_player: Player) -> float:
 	return REVIVE_BASE_TIME + maxf(float(downed_player.down_count - 1), 0.0) * REVIVE_DOWN_PENALTY
 
 
+func _nearest_downed_peer_for_player(source_player: Player, require_inside_revive_radius: bool) -> int:
+	var nearest_peer_id := 0
+	var nearest_distance := INF
+	for peer_id in players.keys():
+		var peer_int := int(peer_id)
+		if waiting_peer_ids.has(peer_int):
+			continue
+		var downed_player := players[peer_id] as Player
+		if downed_player == null or downed_player == source_player or not downed_player.downed:
+			continue
+		var distance := source_player.position.distance_squared_to(downed_player.position)
+		if require_inside_revive_radius and distance > REVIVE_RADIUS_SQ:
+			continue
+		if distance < nearest_distance:
+			nearest_distance = distance
+			nearest_peer_id = peer_int
+	return nearest_peer_id
+
+
+func _first_active_view_peer_id() -> int:
+	if players.has(SERVER_PEER_ID) and not waiting_peer_ids.has(SERVER_PEER_ID):
+		return SERVER_PEER_ID
+	var peer_ids := []
+	for peer_id in players.keys():
+		var peer_int := int(peer_id)
+		if not waiting_peer_ids.has(peer_int):
+			peer_ids.append(peer_int)
+	peer_ids.sort()
+	return int(peer_ids[0]) if not peer_ids.is_empty() else 0
+
+
+func _peer_display_label(peer_id: int) -> String:
+	if peer_id <= 0:
+		return "队友"
+	var label := "P%d" % (_player_visual_slot(peer_id) + 1)
+	if peer_id == local_peer_id:
+		return "你 %s" % label
+	if peer_id == SERVER_PEER_ID:
+		return "房主 %s" % label
+	return label
+
+
 func _lowest_player_hp_ratio() -> float:
 	var lowest_ratio := 1.0
 	for active_player in players.values():
@@ -2093,7 +2185,12 @@ func _update_discovery_ui() -> void:
 		return
 	if rooms.is_empty():
 		if network_session.is_room_discovery_active():
-			lobby_discovery_label.text = "正在搜索局域网房间..."
+			lobby_discovery_label.text = "正在搜索局域网房间... 房主需要先开房；两边协议需同为 %d；防火墙需允许 UDP %d/%d 和游戏端口 %d。" % [
+				NetworkSessionResource.PROTOCOL_VERSION,
+				NetworkSessionResource.DISCOVERY_PORT,
+				NetworkSessionResource.DISCOVERY_REQUEST_PORT,
+				int(network_port_spin_box.value) if network_port_spin_box != null else NetworkSessionResource.DEFAULT_PORT
+			]
 		else:
 			lobby_discovery_label.text = "未搜索房间"
 		return
@@ -2738,10 +2835,12 @@ func _refresh_hud(delta: float) -> void:
 func _update_hud() -> void:
 	var status_player := player if player != null else _first_player()
 	if status_player == null:
+		if status_hint_label != null:
+			status_hint_label.visible = false
 		return
 	var seconds := int(elapsed)
 	var time_text := "%02d:%02d" % [floori(seconds / 60.0), seconds % 60]
-	var player_state := "倒地" if status_player.downed else "作战"
+	var player_state := _hud_player_state(status_player)
 	hud_label.text = "等级 %d  击杀 %d  波次 %d  生存 %s  玩家 %d  状态 %s  角色 %s" % [
 		level,
 		kills,
@@ -2759,6 +2858,46 @@ func _update_hud() -> void:
 	var relic_text := synced_relic_status_text if _is_network_client() and not synced_relic_status_text.is_empty() else relics.status_text()
 	weapon_label.text = "武器 %s" % weapon_text
 	relic_label.text = "遗物 %s" % relic_text
+	if status_hint_label != null:
+		var hint_text := _status_hint_text(status_player)
+		status_hint_label.text = hint_text
+		status_hint_label.visible = not hint_text.is_empty()
+
+
+func _hud_player_state(status_player: Player) -> String:
+	if waiting_peer_ids.has(local_peer_id):
+		return "观战"
+	if status_player.downed:
+		return "倒地"
+	if game_over:
+		return "结算"
+	return "作战" if run_started else "大厅"
+
+
+func _status_hint_text(status_player: Player) -> String:
+	if not run_started or game_over:
+		return ""
+	if waiting_peer_ids.has(local_peer_id):
+		var target_peer_id := _first_active_view_peer_id()
+		if target_peer_id > 0:
+			return "观战中：正在观看 %s，本局结束后加入下一局。" % _peer_display_label(target_peer_id)
+		return "观战中：本局结束后加入下一局。"
+	if status_player.downed:
+		var revive_percent := int(round(clampf(status_player.revive_progress, 0.0, 1.0) * 100.0))
+		if _has_reviver_nearby(status_player):
+			return "你已倒地：队友正在救援 %d%%。" % revive_percent
+		return "你已倒地：等待队友进入救援圈。"
+	if not status_player.is_combat_active():
+		return ""
+	var nearby_downed_peer := _nearest_downed_peer_for_player(status_player, true)
+	if nearby_downed_peer > 0:
+		var nearby_downed := players[nearby_downed_peer] as Player
+		var nearby_percent := int(round(clampf(nearby_downed.revive_progress, 0.0, 1.0) * 100.0)) if nearby_downed != null else 0
+		return "正在救援 %s  %d%%。" % [_peer_display_label(nearby_downed_peer), nearby_percent]
+	var downed_peer := _nearest_downed_peer_for_player(status_player, false)
+	if downed_peer > 0:
+		return "%s 倒地，靠近救援圈复活队友。" % _peer_display_label(downed_peer)
+	return ""
 
 
 func _local_weapon_status_text() -> String:
