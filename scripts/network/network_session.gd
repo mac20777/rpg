@@ -39,6 +39,7 @@ var discovery_sender: PacketPeerUDP
 var discovery_listener: PacketPeerUDP
 var discovery_broadcast_timer := 0.0
 var discovery_game_port := DEFAULT_PORT
+var discovery_room_name := "RPG 房间"
 var discovery_room_state := "lobby"
 var discovery_player_count := 1
 var discovered_rooms := {}
@@ -190,7 +191,9 @@ func stop_room_advertising() -> void:
 	discovery_sender = null
 
 
-func update_room_advertisement(room_state: String, player_count: int) -> void:
+func update_room_advertisement(room_state: String, player_count: int, room_name := "") -> void:
+	if not room_name.strip_edges().is_empty():
+		discovery_room_name = room_name.strip_edges().left(32)
 	discovery_room_state = room_state
 	discovery_player_count = clampi(player_count, 1, MAX_PLAYERS)
 
@@ -378,6 +381,7 @@ func _update_room_advertising(delta: float) -> void:
 	var payload := {
 		"magic": DISCOVERY_MAGIC,
 		"protocol_version": PROTOCOL_VERSION,
+		"room_name": discovery_room_name,
 		"game_port": discovery_game_port,
 		"room_state": discovery_room_state,
 		"player_count": discovery_player_count,
@@ -405,6 +409,7 @@ func _poll_room_discovery() -> void:
 		discovered_rooms[room_key] = {
 			"address": address,
 			"port": game_port,
+			"room_name": String(data.get("room_name", "RPG 房间")),
 			"room_state": String(data.get("room_state", "lobby")),
 			"player_count": int(data.get("player_count", 1)),
 			"max_players": int(data.get("max_players", MAX_PLAYERS)),

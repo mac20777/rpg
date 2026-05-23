@@ -89,6 +89,7 @@ var network_session
 var network_status_label: Label
 var debug_label: Label
 var version_label: Label
+var lobby_room_name_input: LineEdit
 var network_ip_input: LineEdit
 var network_port_spin_box: SpinBox
 var lobby_overlay: ColorRect
@@ -1140,7 +1141,7 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_overlay.add_child(center)
 
 	var panel := PanelContainer.new()
-	panel.custom_minimum_size = Vector2(620.0, 705.0)
+	panel.custom_minimum_size = Vector2(620.0, 750.0)
 	center.add_child(panel)
 
 	var margin := MarginContainer.new()
@@ -1165,6 +1166,23 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lobby_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	box.add_child(lobby_status_label)
+
+	var room_name_row := HBoxContainer.new()
+	room_name_row.add_theme_constant_override("separation", 8)
+	box.add_child(room_name_row)
+
+	var room_name_label := Label.new()
+	room_name_label.text = "房间名"
+	room_name_label.custom_minimum_size = Vector2(72.0, 32.0)
+	room_name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	room_name_row.add_child(room_name_label)
+
+	lobby_room_name_input = LineEdit.new()
+	lobby_room_name_input.text = "RPG 房间"
+	lobby_room_name_input.placeholder_text = "房间名"
+	lobby_room_name_input.max_length = 32
+	lobby_room_name_input.custom_minimum_size = Vector2(420.0, 32.0)
+	room_name_row.add_child(lobby_room_name_input)
 
 	var address_row := HBoxContainer.new()
 	address_row.add_theme_constant_override("separation", 8)
@@ -1319,7 +1337,14 @@ func _update_room_advertisement_state() -> void:
 	if network_session == null or not network_session.is_host():
 		return
 	var room_state := "running" if run_started else "lobby"
-	network_session.update_room_advertisement(room_state, players.size())
+	network_session.update_room_advertisement(room_state, players.size(), _room_name_text())
+
+
+func _room_name_text() -> String:
+	if lobby_room_name_input == null:
+		return "RPG 房间"
+	var room_name := lobby_room_name_input.text.strip_edges()
+	return room_name if not room_name.is_empty() else "RPG 房间"
 
 
 func _is_peer_active_in_current_run(peer_id: int) -> bool:
@@ -2031,8 +2056,10 @@ func _update_discovery_ui() -> void:
 		return
 	var lines := ["发现房间"]
 	for room in rooms:
+		var room_name := String(room.get("room_name", "RPG 房间"))
 		var state_text := _room_state_text(String(room.get("room_state", "lobby")))
-		lines.append("%s:%d  %s  %d/%d" % [
+		lines.append("%s  %s:%d  %s  %d/%d" % [
+			room_name,
 			String(room.get("address", "")),
 			int(room.get("port", NetworkSessionResource.DEFAULT_PORT)),
 			state_text,
@@ -2071,6 +2098,8 @@ func _update_lobby_ui() -> void:
 		lobby_host_button.disabled = in_network_session
 	if lobby_join_button != null:
 		lobby_join_button.disabled = in_network_session
+	if lobby_room_name_input != null:
+		lobby_room_name_input.editable = not in_network_session or is_host
 	if lobby_discovery_button != null:
 		lobby_discovery_button.disabled = in_network_session
 		lobby_discovery_button.text = "刷新房间" if network_session != null and network_session.is_room_discovery_active() else "搜索房间"
@@ -2094,7 +2123,7 @@ func _lobby_status_text(is_host: bool, is_client: bool) -> String:
 	if is_host:
 		if lobby_auto_start_timer >= 0.0:
 			return "全员已准备，%.1f 秒后自动开始。" % maxf(lobby_auto_start_timer, 0.0)
-		return "房间 IP %s  端口 %d，已广播房间，所有玩家准备后自动开始。" % [_lan_address_hint(), int(network_port_spin_box.value)]
+		return "房间 %s  IP %s  端口 %d，已广播房间。" % [_room_name_text(), _lan_address_hint(), int(network_port_spin_box.value)]
 	if is_client:
 		if lobby_auto_start_timer >= 0.0:
 			return "全员已准备，等待房主自动开局 %.1f 秒。" % maxf(lobby_auto_start_timer, 0.0)
