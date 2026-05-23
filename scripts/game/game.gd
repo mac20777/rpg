@@ -63,7 +63,16 @@ const PLAYER_COLORS := [
 	Color(0.54, 0.72, 0.25),
 	Color(0.75, 0.48, 0.90),
 	Color(0.92, 0.32, 0.42),
-	Color(0.30, 0.58, 0.95)
+	Color(0.30, 0.58, 0.95),
+	Color(0.95, 0.78, 0.24),
+	Color(0.20, 0.88, 0.48),
+	Color(0.96, 0.42, 0.78),
+	Color(0.48, 0.86, 0.96),
+	Color(0.70, 0.52, 0.22),
+	Color(0.62, 0.78, 0.96),
+	Color(0.95, 0.62, 0.55),
+	Color(0.68, 0.88, 0.30),
+	Color(0.82, 0.64, 0.98)
 ]
 
 var rng := RandomNumberGenerator.new()
@@ -1131,7 +1140,7 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_overlay.add_child(center)
 
 	var panel := PanelContainer.new()
-	panel.custom_minimum_size = Vector2(580.0, 545.0)
+	panel.custom_minimum_size = Vector2(620.0, 705.0)
 	center.add_child(panel)
 
 	var margin := MarginContainer.new()
@@ -1226,7 +1235,7 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_players_label = Label.new()
 	lobby_players_label.text = ""
 	lobby_players_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	lobby_players_label.custom_minimum_size = Vector2(480.0, 150.0)
+	lobby_players_label.custom_minimum_size = Vector2(540.0, 300.0)
 	box.add_child(lobby_players_label)
 
 
@@ -1780,12 +1789,22 @@ func _player_identity_label(peer_id: int, slot: int) -> String:
 func _spawn_position_for_peer(peer_id: int) -> Vector2:
 	var offsets := [
 		Vector2.ZERO,
-		Vector2(44.0, 0.0),
-		Vector2(-44.0, 0.0),
-		Vector2(0.0, 44.0),
-		Vector2(0.0, -44.0)
+		Vector2(58.0, 0.0),
+		Vector2(29.0, 50.0),
+		Vector2(-29.0, 50.0),
+		Vector2(-58.0, 0.0),
+		Vector2(-29.0, -50.0),
+		Vector2(29.0, -50.0),
+		Vector2(118.0, 0.0),
+		Vector2(83.0, 83.0),
+		Vector2(0.0, 118.0),
+		Vector2(-83.0, 83.0),
+		Vector2(-118.0, 0.0),
+		Vector2(-83.0, -83.0),
+		Vector2(0.0, -118.0),
+		Vector2(83.0, -83.0)
 	]
-	var slot: int = 0 if peer_id == SERVER_PEER_ID else abs(peer_id) % (offsets.size() - 1) + 1
+	var slot := _player_visual_slot(peer_id) % offsets.size()
 	return _get_arena_rect().get_center() + offsets[slot]
 
 
@@ -1938,7 +1957,10 @@ func _upgrade_choice_key(choices: Array) -> String:
 
 
 func _player_count_pressure_multiplier() -> float:
-	return 1.0 + maxf(float(players.size() - 1), 0.0) * 0.35
+	var extra_players := maxf(float(players.size() - 1), 0.0)
+	var early_scale := minf(extra_players, 5.0) * 0.35
+	var high_count_scale := maxf(extra_players - 5.0, 0.0) * 0.16
+	return 1.0 + early_scale + high_count_scale
 
 
 func _scaled_elapsed_for_player_count() -> float:
