@@ -102,6 +102,7 @@ var lobby_single_button: Button
 var lobby_host_button: Button
 var lobby_join_button: Button
 var lobby_discovery_button: Button
+var lobby_discovery_select: OptionButton
 var lobby_leave_button: Button
 var lobby_discovery_label: Label
 var hp_bar: ProgressBar
@@ -157,6 +158,8 @@ var lobby_ready := {}
 var waiting_peer_ids := {}
 var run_participant_peer_ids := {}
 var lobby_auto_start_timer := -1.0
+var selected_discovery_room_key := ""
+var discovery_room_list_signature := ""
 var local_run_recorded := false
 var network_state := NET_STATE_OFFLINE_LOBBY
 var debug_overlay_visible := false
@@ -1230,6 +1233,12 @@ func _create_lobby_overlay(root: Control) -> void:
 	lobby_leave_button.pressed.connect(_use_offline_mode)
 	network_row.add_child(lobby_leave_button)
 
+	lobby_discovery_select = OptionButton.new()
+	lobby_discovery_select.custom_minimum_size = Vector2(540.0, 32.0)
+	lobby_discovery_select.visible = false
+	lobby_discovery_select.item_selected.connect(_on_discovery_room_selected)
+	box.add_child(lobby_discovery_select)
+
 	lobby_discovery_label = Label.new()
 	lobby_discovery_label.text = "未搜索房间"
 	lobby_discovery_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1413,6 +1422,19 @@ func _update_client_network(delta: float) -> void:
 	_send_local_input(delta)
 	if _has_local_active_player() and player != null and not game_over and not choosing_upgrade:
 		player.update_movement_from_input(delta, _get_arena_rect(), player.read_local_input_state())
+	_update_client_bullet_visuals(delta)
+	_update_visual_effects(delta)
+
+
+func _update_client_bullet_visuals(delta: float) -> void:
+	if bullets.is_empty():
+		return
+	for bullet_index in range(bullets.size() - 1, -1, -1):
+		var bullet: BulletState = bullets[bullet_index]
+		bullet.position += bullet.velocity * delta
+		bullet.lifetime -= delta
+		if bullet.lifetime <= 0.0:
+			_remove_bullet_at(bullet_index)
 
 
 func _send_local_input(delta: float) -> void:
@@ -2018,26 +2040,39 @@ func _is_private_lan_ipv4(address: String) -> bool:
 func _search_lan_rooms() -> void:
 	if network_session == null:
 		return
+	selected_discovery_room_key = ""
+	discovery_room_list_signature = ""
+	if network_session.is_room_discovery_active():
+		network_session.stop_room_discovery()
 	var error: Error = network_session.start_room_discovery()
 	if error != OK:
+		if lobby_discovery_select != null:
+			lobby_discovery_select.clear()
+			lobby_discovery_select.visible = false
+			lobby_discovery_select.disabled = true
 		if lobby_discovery_label != null:
 			lobby_discovery_label.text = "搜索失败：UDP 端口 %d 不可用（错误 %s）" % [NetworkSessionResource.DISCOVERY_PORT, error]
 		return
-	_apply_first_discovered_room_to_inputs()
 	_update_discovery_ui()
 
 
 func _on_discovered_rooms_changed() -> void:
-	_apply_first_discovered_room_to_inputs()
 	_update_discovery_ui()
 
 
-func _apply_first_discovered_room_to_inputs() -> void:
+func _on_discovery_room_selected(index: int) -> void:
 	if network_session == null:
 		return
-	var room: Dictionary = network_session.first_discovered_room()
-	if room.is_empty():
+	var rooms: Array = network_session.discovered_room_list()
+	if index < 0 or index >= rooms.size():
 		return
+	var room: Dictionary = rooms[index]
+	selected_discovery_room_key = _room_discovery_key(room)
+	_apply_discovered_room_to_inputs(room)
+	_update_discovery_ui()
+
+
+func _apply_discovered_room_to_inputs(room: Dictionary) -> void:
 	if network_ip_input != null:
 		network_ip_input.text = String(room.get("address", network_ip_input.text))
 	if network_port_spin_box != null:
@@ -2045,29 +2080,94 @@ func _apply_first_discovered_room_to_inputs() -> void:
 
 
 func _update_discovery_ui() -> void:
-	if lobby_discovery_label == null or network_session == null:
+	if network_session == null:
+		return
+	var in_network_session: bool = not network_session.is_offline()
+	if in_network_session:
+		if lobby_discovery_select != null:
+			lobby_discovery_select.visible = false
 		return
 	var rooms: Array = network_session.discovered_room_list()
+	_update_discovery_select(rooms)
+	if lobby_discovery_label == null:
+		return
 	if rooms.is_empty():
 		if network_session.is_room_discovery_active():
 			lobby_discovery_label.text = "正在搜索局域网房间..."
 		else:
 			lobby_discovery_label.text = "未搜索房间"
 		return
-	var lines := ["发现房间"]
+	lobby_discovery_label.text = "已发现 %d 个房间，选择后点击加入。" % rooms.size()
+
+
+func _update_discovery_select(rooms: Array) -> void:
+	if lobby_discovery_select == null:
+		return
+	if rooms.is_empty():
+		if discovery_room_list_signature != "":
+			lobby_discovery_select.clear()
+		discovery_room_list_signature = ""
+		lobby_discovery_select.visible = false
+		lobby_discovery_select.disabled = true
+		selected_discovery_room_key = ""
+		return
+	var signature := _discovery_rooms_signature(rooms)
+	if signature == discovery_room_list_signature:
+		lobby_discovery_select.visible = true
+		lobby_discovery_select.disabled = false
+		return
+	discovery_room_list_signature = signature
+	lobby_discovery_select.clear()
+	lobby_discovery_select.visible = true
+	lobby_discovery_select.disabled = false
+	var selected_index := -1
+	for index in range(rooms.size()):
+		var room: Dictionary = rooms[index]
+		var room_key := _room_discovery_key(room)
+		lobby_discovery_select.add_item(_room_discovery_label(room))
+		if room_key == selected_discovery_room_key:
+			selected_index = index
+	if selected_index < 0:
+		selected_index = 0
+		var selected_room: Dictionary = rooms[selected_index]
+		selected_discovery_room_key = _room_discovery_key(selected_room)
+		_apply_discovered_room_to_inputs(selected_room)
+	lobby_discovery_select.select(selected_index)
+
+
+func _discovery_rooms_signature(rooms: Array) -> String:
+	var parts := []
 	for room in rooms:
-		var room_name := String(room.get("room_name", "RPG 房间"))
-		var state_text := _room_state_text(String(room.get("room_state", "lobby")))
-		lines.append("%s  %s:%d  %s  %d/%d" % [
-			room_name,
-			String(room.get("address", "")),
-			int(room.get("port", NetworkSessionResource.DEFAULT_PORT)),
-			state_text,
-			int(room.get("player_count", 1)),
-			int(room.get("max_players", NetworkSessionResource.MAX_PLAYERS))
+		var room_data: Dictionary = room
+		parts.append("%s|%s|%d|%s|%d|%d" % [
+			_room_discovery_key(room_data),
+			String(room_data.get("room_name", "RPG 房间")),
+			int(room_data.get("protocol_version", NetworkSessionResource.PROTOCOL_VERSION)),
+			String(room_data.get("room_state", "lobby")),
+			int(room_data.get("player_count", 1)),
+			int(room_data.get("max_players", NetworkSessionResource.MAX_PLAYERS))
 		])
-	lines.append("已自动填入第一个房间，点击加入。")
-	lobby_discovery_label.text = "\n".join(lines)
+	return "\n".join(parts)
+
+
+func _room_discovery_key(room: Dictionary) -> String:
+	return "%s:%d" % [
+		String(room.get("address", "")),
+		int(room.get("port", NetworkSessionResource.DEFAULT_PORT))
+	]
+
+
+func _room_discovery_label(room: Dictionary) -> String:
+	var room_name := String(room.get("room_name", "RPG 房间"))
+	var state_text := _room_state_text(String(room.get("room_state", "lobby")))
+	return "%s  %s:%d  %s  %d/%d" % [
+		room_name,
+		String(room.get("address", "")),
+		int(room.get("port", NetworkSessionResource.DEFAULT_PORT)),
+		state_text,
+		int(room.get("player_count", 1)),
+		int(room.get("max_players", NetworkSessionResource.MAX_PLAYERS))
+	]
 
 
 func _room_state_text(room_state: String) -> String:
@@ -2308,6 +2408,8 @@ func _make_world_snapshot() -> Dictionary:
 	for bullet: BulletState in bullets:
 		bullets_data.append({
 			"position": bullet.position,
+			"velocity": bullet.velocity,
+			"lifetime": bullet.lifetime,
 			"radius": bullet.radius,
 			"color": bullet.color
 		})
@@ -2445,9 +2547,9 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 	for bullet_data in snapshot.get("bullets", []):
 		bullets.append(BulletState.new(
 			bullet_data.get("position", Vector2.ZERO),
-			Vector2.ZERO,
+			bullet_data.get("velocity", Vector2.ZERO),
 			0.0,
-			1.0,
+			float(bullet_data.get("lifetime", 1.0)),
 			float(bullet_data.get("radius", 4.0)),
 			0,
 			bullet_data.get("color", Color(1.0, 0.86, 0.35))
