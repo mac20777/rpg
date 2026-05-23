@@ -42,6 +42,7 @@ const SERVER_PEER_ID := 1
 const NETWORK_INPUT_INTERVAL := 0.033
 const WORLD_SNAPSHOT_INTERVAL := 0.08
 const LOBBY_AUTO_START_DELAY := 3.0
+const UPGRADE_SELECTION_TIME_LIMIT := 20.0
 const REVIVE_RADIUS := 72.0
 const REVIVE_RADIUS_SQ := REVIVE_RADIUS * REVIVE_RADIUS
 const REVIVE_BASE_TIME := 3.5
@@ -112,6 +113,7 @@ var upgrade_choices: Array = []
 var upgrade_choices_by_peer := {}
 var upgrade_selected_peer_ids := {}
 var upgrade_reward_source := UpgradeCatalog.REWARD_LEVEL
+var upgrade_selection_timer := -1.0
 var zombie_grid := {}
 var spawn_director := SpawnDirector.new()
 var elite_director := EliteDirector.new()
@@ -197,6 +199,7 @@ func _process(delta: float) -> void:
 
 	if choosing_upgrade:
 		_send_local_input(delta)
+		_update_upgrade_selection(delta)
 		if player != null:
 			camera.global_position = player.position
 		_update_network_snapshot(delta)
@@ -836,6 +839,7 @@ func _check_level_up() -> void:
 func _show_upgrade_choices(reward_source := UpgradeCatalog.REWARD_LEVEL) -> void:
 	choosing_upgrade = true
 	upgrade_reward_source = reward_source
+	upgrade_selection_timer = UPGRADE_SELECTION_TIME_LIMIT
 	upgrade_choices_by_peer.clear()
 	upgrade_selected_peer_ids.clear()
 	for peer_id in _upgrade_participant_peer_ids():
@@ -852,6 +856,24 @@ func _roll_upgrade_choices_for_peer(peer_id: int, reward_source := UpgradeCatalo
 	return UpgradeCatalog.roll_choices(rng, loadout, state, relics, level, elapsed, 3)
 
 
+func _update_upgrade_selection(delta: float) -> void:
+	if _is_network_client() or not choosing_upgrade:
+		return
+	if upgrade_selection_timer < 0.0:
+		upgrade_selection_timer = UPGRADE_SELECTION_TIME_LIMIT
+	upgrade_selection_timer -= delta
+	_show_current_local_upgrade_choices()
+	if upgrade_selection_timer > 0.0:
+		return
+	var pending_peer_ids := []
+	for peer_id in _upgrade_participant_peer_ids():
+		if not upgrade_selected_peer_ids.has(peer_id):
+			pending_peer_ids.append(peer_id)
+	for peer_id in pending_peer_ids:
+		if choosing_upgrade:
+			_apply_upgrade_for_peer(int(peer_id), 0)
+
+
 func _show_current_local_upgrade_choices() -> void:
 	if not _has_local_active_player() or not upgrade_choices_by_peer.has(local_peer_id):
 		upgrade_overlay.visible = false
@@ -861,7 +883,7 @@ func _show_current_local_upgrade_choices() -> void:
 	var already_selected := upgrade_selected_peer_ids.has(local_peer_id)
 	var hint := _upgrade_hint_for_source(upgrade_reward_source)
 	if already_selected:
-		hint = "已选择，等待其他玩家确认"
+		hint = "已选择，等待其他玩家确认%s" % _upgrade_timer_suffix()
 	_show_local_upgrade_choices(
 		_upgrade_title_for_source(upgrade_reward_source),
 		hint,
@@ -946,6 +968,7 @@ func _finish_upgrade_phase_if_complete() -> void:
 		if not upgrade_selected_peer_ids.has(peer_id):
 			return
 	choosing_upgrade = false
+	upgrade_selection_timer = -1.0
 	upgrade_overlay.visible = false
 	synced_upgrade_choice_key = ""
 	upgrade_choices_by_peer.clear()
@@ -961,8 +984,14 @@ func _upgrade_title_for_source(reward_source: String) -> String:
 
 
 func _upgrade_hint_for_source(reward_source: String) -> String:
-	return "选择自己的高品质奖励" if reward_source == UpgradeCatalog.REWARD_CHEST else "按 1/2/3 或点击按钮"
-	_broadcast_world_snapshot_now()
+	var base := "选择自己的高品质奖励" if reward_source == UpgradeCatalog.REWARD_CHEST else "按 1/2/3 或点击按钮"
+	return "%s%s" % [base, _upgrade_timer_suffix()]
+
+
+func _upgrade_timer_suffix() -> String:
+	if upgrade_selection_timer < 0.0:
+		return ""
+	return "，剩余 %.0f 秒" % ceilf(upgrade_selection_timer)
 
 
 func _create_ui() -> void:
@@ -1298,6 +1327,7 @@ func _debug_overlay_text() -> String:
 		+ "waiting: %s\n" % _debug_peer_list(waiting_peer_ids.keys())
 		+ "ready: %s\n" % _debug_ready_list()
 		+ "auto start: %.1f\n" % lobby_auto_start_timer
+		+ "upgrade timer: %.1f\n" % upgrade_selection_timer
 		+ "entities: P%d Z%d B%d XP%d\n" % [players.size(), zombies.size(), bullets.size(), xp_orbs.size()]
 		+ "snapshot: %d bytes  recv %d  sent %d  age %dms\n" % [
 			int(snapshot_debug.get("last_size", 0)),
@@ -2104,6 +2134,7 @@ func _clear_network_view_state() -> void:
 	upgrade_choices_by_peer.clear()
 	upgrade_selected_peer_ids.clear()
 	upgrade_reward_source = UpgradeCatalog.REWARD_LEVEL
+	upgrade_selection_timer = -1.0
 	zombie_grid.clear()
 	choosing_upgrade = false
 	synced_upgrade_choice_key = ""
@@ -2194,6 +2225,7 @@ func _make_world_snapshot() -> Dictionary:
 		"game_over": game_over,
 		"choosing_upgrade": choosing_upgrade,
 		"upgrade_reward_source": upgrade_reward_source,
+		"upgrade_selection_timer": upgrade_selection_timer,
 		"upgrade_title": _upgrade_title_for_source(upgrade_reward_source),
 		"upgrade_hint": _upgrade_hint_for_source(upgrade_reward_source),
 		"upgrade_choices_by_peer": _serialize_upgrade_choices_by_peer(),
@@ -2233,6 +2265,7 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		local_run_recorded = false
 	choosing_upgrade = bool(snapshot.get("choosing_upgrade", false))
 	upgrade_reward_source = String(snapshot.get("upgrade_reward_source", upgrade_reward_source))
+	upgrade_selection_timer = float(snapshot.get("upgrade_selection_timer", upgrade_selection_timer))
 	_apply_upgrade_choices_by_peer_snapshot(snapshot.get("upgrade_choices_by_peer", {}))
 	_apply_upgrade_selected_peer_ids_snapshot(snapshot.get("upgrade_selected_peer_ids", []))
 	spawn_director.wave_index = int(snapshot.get("wave_index", spawn_director.wave_index))
@@ -2555,6 +2588,7 @@ func _restart_game() -> void:
 	upgrade_choices_by_peer.clear()
 	upgrade_selected_peer_ids.clear()
 	upgrade_reward_source = UpgradeCatalog.REWARD_LEVEL
+	upgrade_selection_timer = -1.0
 	zombie_grid.clear()
 	spawn_director.reset()
 	elite_director.reset()
