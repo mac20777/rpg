@@ -15,8 +15,14 @@ const MIN_HOLDOUT_INTERVAL := 108.0
 const MAX_HOLDOUT_INTERVAL := 136.0
 const MAX_ACTIVE_HOLDOUTS := 1
 
+const FIRST_MERCHANT_TIME := 150.0
+const MIN_MERCHANT_INTERVAL := 180.0
+const MAX_MERCHANT_INTERVAL := 240.0
+const MAX_ACTIVE_MERCHANTS := 1
+
 var supply_timer := 0.0
 var holdout_timer := 0.0
+var merchant_timer := 0.0
 
 
 func _init() -> void:
@@ -26,10 +32,18 @@ func _init() -> void:
 func reset() -> void:
 	supply_timer = FIRST_SUPPLY_TIME
 	holdout_timer = FIRST_HOLDOUT_TIME
+	merchant_timer = FIRST_MERCHANT_TIME
 
 
-func update(delta: float, active_supply_count: int, active_holdout_count: int, hp_ratio: float, rng: RandomNumberGenerator) -> Dictionary:
-	var requests := {"supplies": [], "holdout": false}
+func update(
+	delta: float,
+	active_supply_count: int,
+	active_holdout_count: int,
+	active_merchant_count: int,
+	hp_ratio: float,
+	rng: RandomNumberGenerator
+) -> Dictionary:
+	var requests := {"supplies": [], "holdout": false, "merchant": false}
 
 	if active_supply_count < MAX_ACTIVE_SUPPLIES:
 		supply_timer -= delta
@@ -42,6 +56,12 @@ func update(delta: float, active_supply_count: int, active_holdout_count: int, h
 		if holdout_timer <= 0.0:
 			requests["holdout"] = true
 			holdout_timer = rng.randf_range(MIN_HOLDOUT_INTERVAL, MAX_HOLDOUT_INTERVAL)
+
+	if active_merchant_count < MAX_ACTIVE_MERCHANTS:
+		merchant_timer -= delta
+		if merchant_timer <= 0.0:
+			requests["merchant"] = true
+			merchant_timer = rng.randf_range(MIN_MERCHANT_INTERVAL, MAX_MERCHANT_INTERVAL)
 
 	return requests
 

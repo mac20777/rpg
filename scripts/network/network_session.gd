@@ -6,6 +6,7 @@ signal peer_joined(peer_id: int)
 signal peer_left(peer_id: int)
 signal world_snapshot_received(snapshot: Dictionary)
 signal upgrade_choice_received(peer_id: int, choice_index: int)
+signal merchant_purchase_received(peer_id: int, merchant_id: int, offer_id: String, offer_index: int)
 signal restart_requested(peer_id: int)
 signal lobby_ready_received(peer_id: int, is_ready: bool)
 signal game_start_received()
@@ -28,8 +29,11 @@ const DISCOVERY_PROBE_INTERVAL := 0.8
 const DISCOVERY_ROOM_TIMEOUT := 3.5
 const MAX_PLAYERS := 15
 const SERVER_PEER_ID := 1
-const PROTOCOL_VERSION := 7
+const PROTOCOL_VERSION := 8
 const MAX_UPGRADE_CHOICE_INDEX := 8
+const MAX_MERCHANT_OFFER_INDEX := 8
+const MAX_MERCHANT_ID := 1000000000
+const MAX_OFFER_ID_LENGTH := 64
 const MAX_MOUSE_TARGET_ABS := 100000.0
 
 var mode := MODE_OFFLINE
@@ -143,6 +147,16 @@ func send_upgrade_choice(choice_index: int) -> void:
 		_submit_upgrade_choice.rpc_id(SERVER_PEER_ID, choice_index)
 	elif mode == MODE_HOST or mode == MODE_OFFLINE:
 		upgrade_choice_received.emit(SERVER_PEER_ID, choice_index)
+
+
+func send_merchant_purchase(merchant_id: int, offer_id: String, offer_index: int) -> void:
+	if not _is_valid_merchant_purchase(merchant_id, offer_id, offer_index):
+		return
+	var safe_offer_id := _sanitize_offer_id(offer_id)
+	if mode == MODE_CLIENT:
+		_submit_merchant_purchase.rpc_id(SERVER_PEER_ID, merchant_id, safe_offer_id, offer_index)
+	elif mode == MODE_HOST or mode == MODE_OFFLINE:
+		merchant_purchase_received.emit(SERVER_PEER_ID, merchant_id, safe_offer_id, offer_index)
 
 
 func request_restart() -> void:
@@ -281,6 +295,20 @@ func _submit_upgrade_choice(choice_index: int) -> void:
 	if not _is_valid_upgrade_choice_index(choice_index):
 		return
 	upgrade_choice_received.emit(sender_id, choice_index)
+
+
+@rpc("any_peer", "reliable")
+func _submit_merchant_purchase(merchant_id: int, offer_id: String, offer_index: int) -> void:
+	if mode != MODE_HOST:
+		return
+	var sender_id := multiplayer.get_remote_sender_id()
+	if sender_id <= 0:
+		return
+	if not _is_verified_peer(sender_id):
+		return
+	if not _is_valid_merchant_purchase(merchant_id, offer_id, offer_index):
+		return
+	merchant_purchase_received.emit(sender_id, merchant_id, _sanitize_offer_id(offer_id), offer_index)
 
 
 @rpc("any_peer", "reliable")
@@ -561,6 +589,20 @@ func _is_verified_peer(peer_id: int) -> bool:
 
 func _is_valid_upgrade_choice_index(choice_index: int) -> bool:
 	return choice_index >= 0 and choice_index <= MAX_UPGRADE_CHOICE_INDEX
+
+
+func _is_valid_merchant_purchase(merchant_id: int, offer_id: String, offer_index: int) -> bool:
+	return (
+		merchant_id >= 0
+		and merchant_id <= MAX_MERCHANT_ID
+		and offer_index >= 0
+		and offer_index <= MAX_MERCHANT_OFFER_INDEX
+		and not _sanitize_offer_id(offer_id).is_empty()
+	)
+
+
+func _sanitize_offer_id(offer_id: String) -> String:
+	return offer_id.strip_edges().left(MAX_OFFER_ID_LENGTH)
 
 
 func _sanitize_input_state(input_state: Dictionary) -> Dictionary:

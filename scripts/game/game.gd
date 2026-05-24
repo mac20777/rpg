@@ -4,6 +4,11 @@ const EnemyCatalog := preload("res://scripts/enemies/enemy_catalog.gd")
 const SpawnDirector := preload("res://scripts/game/spawn_director.gd")
 const EliteDirector := preload("res://scripts/game/elite_director.gd")
 const MapEventDirector := preload("res://scripts/events/map_event_director.gd")
+const GoldWallets := preload("res://scripts/economy/gold_wallets.gd")
+const GoldDropPolicy := preload("res://scripts/economy/gold_drop_policy.gd")
+const MerchantCatalog := preload("res://scripts/merchants/merchant_catalog.gd")
+const MerchantPanelView := preload("res://scripts/merchants/merchant_panel_view.gd")
+const MerchantShopState := preload("res://scripts/merchants/merchant_shop_state.gd")
 const UpgradeCatalog := preload("res://scripts/upgrades/upgrade_catalog.gd")
 const UpgradeState := preload("res://scripts/upgrades/upgrade_state.gd")
 const WeaponLoadout := preload("res://scripts/weapons/weapon_loadout.gd")
@@ -12,6 +17,8 @@ const MetaProgression := preload("res://scripts/meta/meta_progression.gd")
 const RewardChestState := preload("res://scripts/entities/reward_chest_state.gd")
 const SupplyCacheState := preload("res://scripts/entities/supply_cache_state.gd")
 const HoldoutEventState := preload("res://scripts/entities/holdout_event_state.gd")
+const GoldOrbState := preload("res://scripts/entities/gold_orb_state.gd")
+const MerchantEventState := preload("res://scripts/entities/merchant_event_state.gd")
 const VisualEffectState := preload("res://scripts/entities/visual_effect_state.gd")
 const FeedbackAudioResource := preload("res://scripts/feedback/feedback_audio.gd")
 const VisualEffectPoolResource := preload("res://scripts/feedback/visual_effect_pool.gd")
@@ -20,12 +27,19 @@ const NetworkSessionResource := preload("res://scripts/network/network_session.g
 const ARENA_SIZE := Vector2(1800.0, 1100.0)
 const PLAYER_RADIUS := 16.0
 const XP_RADIUS := 6.0
+const GOLD_RADIUS := 5.0
 const CHEST_PICKUP_RADIUS := 34.0
 const SUPPLY_PICKUP_RADIUS := 34.0
 const SUPPLY_BOMB_RADIUS := 500.0
 const INITIAL_XP_TO_NEXT := 5
 const PLAYER_XP_COLLISION_RADIUS := PLAYER_RADIUS + XP_RADIUS
 const PLAYER_XP_COLLISION_RADIUS_SQ := PLAYER_XP_COLLISION_RADIUS * PLAYER_XP_COLLISION_RADIUS
+const PLAYER_GOLD_COLLISION_RADIUS := PLAYER_RADIUS + GOLD_RADIUS
+const PLAYER_GOLD_COLLISION_RADIUS_SQ := PLAYER_GOLD_COLLISION_RADIUS * PLAYER_GOLD_COLLISION_RADIUS
+const MERCHANT_RADIUS := 116.0
+const MERCHANT_LIFETIME := 42.0
+const MERCHANT_REOPEN_COOLDOWN := 1.5
+const MERCHANT_INTERACT_RADIUS_PADDING := 18.0
 const COLLISION_CELL_SIZE := 96.0
 const DETAILED_ZOMBIE_DRAW_LIMIT := 180
 const DETAILED_XP_DRAW_LIMIT := 220
@@ -125,9 +139,11 @@ var feedback_audio
 var zombies: Array[ZombieState] = []
 var bullets: Array[BulletState] = []
 var xp_orbs: Array[XpOrbState] = []
+var gold_orbs: Array[GoldOrbState] = []
 var reward_chests: Array = []
 var supply_caches: Array = []
 var holdout_events: Array = []
+var merchant_events: Array = []
 var visual_effects := VisualEffectPoolResource.new()
 var upgrade_choices: Array = []
 var upgrade_choices_by_peer := {}
@@ -138,8 +154,16 @@ var zombie_grid := {}
 var spawn_director := SpawnDirector.new()
 var elite_director := EliteDirector.new()
 var map_event_director := MapEventDirector.new()
+var gold_wallets := GoldWallets.new()
+var gold_drop_policy := GoldDropPolicy.new()
+var merchant_panel_view := MerchantPanelView.new()
+var merchant_shop := MerchantShopState.new()
 var weapon_loadout := WeaponLoadout.new()
 var player_upgrade_states := {}
+var next_merchant_id := 1
+var local_open_merchant_id := -1
+var merchant_status_message := ""
+var merchant_status_timer := 0.0
 var relics := RelicCollection.new()
 var meta_progression := MetaProgression.new()
 
@@ -210,6 +234,7 @@ func _process(delta: float) -> void:
 
 	if _is_network_client():
 		_update_client_network(delta)
+		_update_local_merchant_ui(delta)
 		if player != null:
 			camera.global_position = player.position
 		_refresh_hud(delta)
@@ -223,6 +248,7 @@ func _process(delta: float) -> void:
 		return
 
 	if choosing_upgrade:
+		_close_local_merchant_panel()
 		_send_local_input(delta)
 		_update_upgrade_selection(delta)
 		if player != null:
@@ -249,6 +275,7 @@ func _process(delta: float) -> void:
 	_update_bullets(delta)
 	_update_visual_effects(delta)
 	_update_xp_orbs(delta)
+	_update_gold_orbs(delta)
 	if not choosing_upgrade:
 		_update_reward_chests()
 	_refresh_hud(delta)
@@ -284,6 +311,16 @@ func _unhandled_input(event: InputEvent) -> void:
 		if choosing_upgrade:
 			if event.keycode >= KEY_1 and event.keycode <= KEY_3:
 				_choose_upgrade(int(event.keycode) - int(KEY_1))
+			return
+		if _is_local_merchant_panel_open():
+			if event.keycode >= KEY_1 and event.keycode <= KEY_3:
+				_request_merchant_purchase(int(event.keycode) - int(KEY_1))
+				return
+			if event.keycode == KEY_ESCAPE:
+				_close_local_merchant_panel()
+				return
+		elif event.keycode == KEY_E:
+			_try_open_nearby_merchant()
 
 
 func _draw() -> void:
@@ -293,12 +330,20 @@ func _draw() -> void:
 	for holdout in holdout_events:
 		if draw_rect.has_point(holdout.position):
 			_draw_holdout_event(holdout)
+	for merchant in merchant_events:
+		if draw_rect.has_point(merchant.position):
+			_draw_merchant_event(merchant)
 	for orb: XpOrbState in xp_orbs:
 		if not draw_rect.has_point(orb.position):
 			continue
 		draw_circle(orb.position, XP_RADIUS, Color(0.35, 0.95, 0.95))
 		if draw_xp_details:
 			draw_arc(orb.position, XP_RADIUS + 3.0, 0.0, TAU, 16, Color(0.1, 0.4, 0.45), 2.0)
+	for gold: GoldOrbState in gold_orbs:
+		if not draw_rect.has_point(gold.position):
+			continue
+		draw_circle(gold.position, GOLD_RADIUS + 2.0, Color(0.12, 0.08, 0.02))
+		draw_circle(gold.position, GOLD_RADIUS, Color(1.0, 0.78, 0.22))
 	for chest in reward_chests:
 		if draw_rect.has_point(chest.position):
 			_draw_reward_chest(chest)
@@ -368,16 +413,21 @@ func _update_player_status_timers(delta: float) -> void:
 
 func _update_map_events(delta: float) -> void:
 	var hp_ratio := _lowest_player_hp_ratio()
-	var event_requests := map_event_director.update(delta, supply_caches.size(), holdout_events.size(), hp_ratio, rng)
+	var event_requests := map_event_director.update(delta, supply_caches.size(), holdout_events.size(), merchant_events.size(), hp_ratio, rng)
 	for supply_kind in event_requests["supplies"]:
 		_spawn_supply_cache(String(supply_kind))
 	if bool(event_requests["holdout"]):
 		_spawn_holdout_event()
+	if bool(event_requests["merchant"]):
+		_spawn_merchant_event()
 
+	_update_merchant_reopen_cooldowns(delta)
 	_update_supply_caches(delta)
+	_update_merchant_events(delta)
 	if choosing_upgrade:
 		return
 	_update_holdout_events(delta)
+	_update_local_merchant_ui(delta)
 
 
 func _spawn_supply_cache(kind: String) -> void:
@@ -390,6 +440,13 @@ func _spawn_holdout_event() -> void:
 	var arena_rect := _get_arena_rect()
 	var position := _random_event_position(arena_rect, 140.0)
 	holdout_events.append(HoldoutEventState.new(position))
+
+
+func _spawn_merchant_event() -> void:
+	var arena_rect := _get_arena_rect()
+	var position := _random_event_position(arena_rect, 160.0)
+	merchant_events.append(MerchantEventState.new(next_merchant_id, position, MERCHANT_RADIUS, MERCHANT_LIFETIME, rng.randi()))
+	next_merchant_id += 1
 
 
 func _random_event_position(arena_rect: Rect2, margin: float) -> Vector2:
@@ -500,13 +557,37 @@ func _update_zombies(delta: float) -> void:
 				_explode_zombie(zombie)
 				killed_zombies = true
 			else:
-				target_player.take_damage(zombie.damage * delta)
+				_damage_player(target_player, zombie.damage * delta)
 				zombie.position -= direction * 24.0 * delta
 			if _are_all_players_downed():
 				_end_game()
 				return
 	if killed_zombies:
 		_remove_dead_zombies()
+
+
+func _damage_player(target_player: Player, amount: float, peer_id := -1) -> void:
+	if target_player == null or amount <= 0.0:
+		return
+	var resolved_peer_id := peer_id if peer_id > 0 else _peer_id_for_player(target_player)
+	var previous_hp := target_player.hp
+	target_player.take_damage(amount)
+	if resolved_peer_id > 0 and target_player.hp < previous_hp:
+		_interrupt_merchant_for_peer(resolved_peer_id)
+
+
+func _peer_id_for_player(target_player: Player) -> int:
+	for peer_id in players.keys():
+		if players[peer_id] == target_player:
+			return int(peer_id)
+	return -1
+
+
+func _interrupt_merchant_for_peer(peer_id: int) -> void:
+	merchant_shop.interrupt(peer_id, MERCHANT_REOPEN_COOLDOWN)
+	if peer_id == local_peer_id:
+		_close_local_merchant_panel()
+		_set_merchant_status("交易被打断")
 
 
 func _update_revives(delta: float) -> void:
@@ -648,10 +729,10 @@ func _explode_zombie(zombie: ZombieState, damages_player := true, damages_enemie
 	_play_feedback_sound("boom", 0.16)
 	var radius_sq := radius * radius
 	if damages_player and radius > 0.0:
-		for active_player in players.values():
-			var target_player := active_player as Player
+		for peer_id in players.keys():
+			var target_player := players[peer_id] as Player
 			if target_player != null and target_player.is_combat_active() and zombie.position.distance_squared_to(target_player.position) <= radius_sq:
-				target_player.take_damage(damage)
+				_damage_player(target_player, damage, int(peer_id))
 	if damages_enemies:
 		_mark_zombie_dead(zombie)
 		_damage_zombies_in_radius(zombie.position, radius, damage, zombie)
@@ -693,7 +774,10 @@ func _mark_zombie_dead(zombie: ZombieState) -> void:
 	_add_visual_effect(zombie.position, death_color, 0.18, zombie.radius * 0.8, zombie.radius * 2.2, "ring")
 	xp_orbs.append(XpOrbState.new(zombie.position, zombie.xp_value))
 	if zombie.is_elite:
+		_grant_gold_to_active_players(rng.randi_range(GoldDropPolicy.ELITE_MIN, GoldDropPolicy.ELITE_MAX))
 		reward_chests.append(RewardChestState.new(zombie.position))
+	else:
+		_maybe_drop_gold(zombie)
 	kills += 1
 
 
@@ -741,6 +825,13 @@ func _remove_xp_orb_at(index: int) -> void:
 	xp_orbs.pop_back()
 
 
+func _remove_gold_orb_at(index: int) -> void:
+	var last_index := gold_orbs.size() - 1
+	if index != last_index:
+		gold_orbs[index] = gold_orbs[last_index]
+	gold_orbs.pop_back()
+
+
 func _remove_reward_chest_at(index: int) -> void:
 	var last_index := reward_chests.size() - 1
 	if index != last_index:
@@ -760,6 +851,18 @@ func _remove_holdout_event_at(index: int) -> void:
 	if index != last_index:
 		holdout_events[index] = holdout_events[last_index]
 	holdout_events.pop_back()
+
+
+func _remove_merchant_event_at(index: int) -> void:
+	var merchant = merchant_events[index]
+	var merchant_id := int(merchant.merchant_id)
+	var last_index := merchant_events.size() - 1
+	if index != last_index:
+		merchant_events[index] = merchant_events[last_index]
+	merchant_events.pop_back()
+	merchant_shop.clear_merchant(merchant_id)
+	if local_open_merchant_id == merchant_id:
+		_close_local_merchant_panel()
 
 
 func _update_feedback_audio(delta: float) -> void:
@@ -824,6 +927,24 @@ func _apply_supply_cache(supply, collecting_player: Player) -> void:
 	_update_hud()
 
 
+func _update_merchant_events(delta: float) -> void:
+	if merchant_events.is_empty():
+		_close_local_merchant_panel()
+		return
+	for merchant_index in range(merchant_events.size() - 1, -1, -1):
+		var merchant: MerchantEventState = merchant_events[merchant_index]
+		merchant.lifetime -= delta
+		if merchant.is_expired():
+			_remove_merchant_event_at(merchant_index)
+			continue
+	if local_open_merchant_id >= 0 and _merchant_by_id(local_open_merchant_id) == null:
+		_close_local_merchant_panel()
+
+
+func _update_merchant_reopen_cooldowns(delta: float) -> void:
+	merchant_shop.update_cooldowns(delta)
+
+
 func _collect_all_xp_orbs(collecting_player: Player) -> void:
 	if xp_orbs.is_empty():
 		return
@@ -838,13 +959,77 @@ func _collect_all_xp_orbs(collecting_player: Player) -> void:
 	_check_level_up()
 
 
+func _update_gold_orbs(delta: float) -> void:
+	gold_drop_policy.update(delta, elapsed)
+	for orb_index in range(gold_orbs.size() - 1, -1, -1):
+		var orb: GoldOrbState = gold_orbs[orb_index]
+		orb.lifetime -= delta
+		if orb.lifetime <= 0.0:
+			_remove_gold_orb_at(orb_index)
+			continue
+		var collecting_player := _closest_alive_player(orb.position)
+		if collecting_player == null:
+			return
+		var pickup_radius_sq := collecting_player.pickup_radius * collecting_player.pickup_radius
+		var to_player: Vector2 = collecting_player.position - orb.position
+		var distance_sq: float = to_player.length_squared()
+		if distance_sq < PLAYER_GOLD_COLLISION_RADIUS_SQ:
+			_grant_gold_to_active_players(orb.value)
+			_remove_gold_orb_at(orb_index)
+			_play_feedback_sound("pickup", 0.08)
+			continue
+		if distance_sq < pickup_radius_sq and distance_sq > 0.0:
+			var direction: Vector2 = to_player / sqrt(distance_sq)
+			orb.position += direction * (250.0 + collecting_player.pickup_radius * 1.65) * delta
+
+
+func _maybe_drop_gold(zombie: ZombieState) -> void:
+	var gold_value := gold_drop_policy.roll_drop_value(zombie.type_id, gold_orbs.size(), rng)
+	if gold_value <= 0:
+		return
+	gold_orbs.append(GoldOrbState.new(zombie.position, gold_value))
+
+
+func _grant_gold_to_active_players(amount: int) -> void:
+	if amount <= 0:
+		return
+	for peer_id in run_participant_peer_ids.keys():
+		var peer_int := int(peer_id)
+		if _is_peer_eligible_for_gold(peer_int):
+			gold_wallets.grant_to_peer(peer_int, amount)
+	_update_hud()
+
+
+func _grant_gold_to_peer(peer_id: int, amount: int) -> void:
+	gold_wallets.grant_to_peer(peer_id, amount)
+
+
+func _is_peer_eligible_for_gold(peer_id: int) -> bool:
+	return run_started and players.has(peer_id) and not waiting_peer_ids.has(peer_id)
+
+
+func _gold_for_peer(peer_id: int) -> int:
+	return gold_wallets.gold_for(peer_id)
+
+
+func _try_spend_gold(peer_id: int, amount: int) -> bool:
+	if amount < 0:
+		return false
+	if not gold_wallets.spend(peer_id, amount):
+		return false
+	_update_hud()
+	return true
+
+
 func _update_holdout_events(delta: float) -> void:
 	for event_index in range(holdout_events.size() - 1, -1, -1):
 		var event = holdout_events[event_index]
 		_update_holdout_event_progress(event, delta)
 		if event.is_complete():
 			_remove_holdout_event_at(event_index)
+			_grant_gold_to_active_players(GoldDropPolicy.HOLDOUT_REWARD)
 			choosing_upgrade = true
+			_close_local_merchant_panel()
 			_show_upgrade_choices(UpgradeCatalog.REWARD_CHEST)
 			return
 		if event.is_expired():
@@ -885,7 +1070,9 @@ func _update_reward_chests() -> void:
 		_add_visual_effect(chest.position, Color(1.0, 0.8, 0.2, 0.75), 0.28, 18.0, 82.0, "burst")
 		_play_feedback_sound("chest", 0.12)
 		_remove_reward_chest_at(chest_index)
+		_grant_gold_to_active_players(GoldDropPolicy.CHEST_REWARD)
 		choosing_upgrade = true
+		_close_local_merchant_panel()
 		_show_upgrade_choices(UpgradeCatalog.REWARD_CHEST)
 		return
 
@@ -899,6 +1086,7 @@ func _check_level_up() -> void:
 	_add_visual_effect(_team_focus_position(), Color(0.35, 0.95, 1.0, 0.72), 0.34, 26.0, 118.0, "burst")
 	_play_feedback_sound("level", 0.18)
 	choosing_upgrade = true
+	_close_local_merchant_panel()
 	_show_upgrade_choices(UpgradeCatalog.REWARD_LEVEL)
 
 
@@ -1203,6 +1391,186 @@ func _upgrade_timer_suffix() -> String:
 	return "，剩余 %.0f 秒" % ceilf(upgrade_selection_timer)
 
 
+func _is_local_merchant_panel_open() -> bool:
+	return merchant_panel_view.is_visible() and local_open_merchant_id >= 0
+
+
+func _try_open_nearby_merchant() -> void:
+	if choosing_upgrade or game_over or not _has_local_active_player():
+		return
+	var local_player := players.get(local_peer_id) as Player
+	if local_player == null or not local_player.is_combat_active():
+		return
+	if merchant_shop.is_in_cooldown(local_peer_id):
+		_set_merchant_status("交易冷却中")
+		return
+	var merchant: MerchantEventState = _nearest_merchant_for_player(local_player)
+	if merchant == null:
+		_set_merchant_status("附近没有商人")
+		return
+	_open_local_merchant_panel(merchant)
+
+
+func _open_local_merchant_panel(merchant: MerchantEventState) -> void:
+	local_open_merchant_id = merchant.merchant_id
+	_ensure_merchant_offers(local_peer_id, merchant)
+	_refresh_merchant_panel()
+
+
+func _close_local_merchant_panel() -> void:
+	local_open_merchant_id = -1
+	merchant_panel_view.hide()
+
+
+func _update_local_merchant_ui(delta: float) -> void:
+	if merchant_status_timer > 0.0:
+		merchant_status_timer = maxf(merchant_status_timer - delta, 0.0)
+	if choosing_upgrade or game_over:
+		_close_local_merchant_panel()
+		return
+	if not _has_local_active_player():
+		_close_local_merchant_panel()
+		return
+	var local_player := players.get(local_peer_id) as Player
+	if local_player == null or not local_player.is_combat_active():
+		_close_local_merchant_panel()
+		return
+	if _is_local_merchant_panel_open():
+		var merchant: MerchantEventState = _merchant_by_id(local_open_merchant_id)
+		if merchant == null or not _is_player_in_merchant_range(local_player, merchant) or merchant_shop.is_in_cooldown(local_peer_id):
+			_close_local_merchant_panel()
+			return
+		_refresh_merchant_panel()
+
+
+func _refresh_merchant_panel() -> void:
+	var merchant: MerchantEventState = _merchant_by_id(local_open_merchant_id)
+	if merchant == null:
+		_close_local_merchant_panel()
+		return
+	var offers := _ensure_merchant_offers(local_peer_id, merchant)
+	var hint := merchant_status_message if merchant_status_timer > 0.0 else "1/2/3 购买，Esc 关闭。受击会打断交易。"
+	var validations := []
+	for offer_index in range(offers.size()):
+		var offer: Dictionary = offers[offer_index]
+		validations.append(_merchant_offer_validation(local_peer_id, merchant, offer))
+	merchant_panel_view.show_offers(
+		"流浪商人  剩余 %.0f 秒  金币 %d" % [ceilf(merchant.lifetime), _gold_for_peer(local_peer_id)],
+		hint,
+		offers,
+		validations
+	)
+
+
+func _set_merchant_status(message: String) -> void:
+	merchant_status_message = message
+	merchant_status_timer = 1.6
+	merchant_panel_view.set_hint(message)
+
+
+func _request_merchant_purchase(offer_index: int) -> void:
+	var merchant: MerchantEventState = _merchant_by_id(local_open_merchant_id)
+	if merchant == null:
+		_close_local_merchant_panel()
+		return
+	var offers := _ensure_merchant_offers(local_peer_id, merchant)
+	if offer_index < 0 or offer_index >= offers.size():
+		return
+	var offer: Dictionary = offers[offer_index]
+	var validation := _merchant_offer_validation(local_peer_id, merchant, offer)
+	if not bool(validation.get("can_buy", false)):
+		_set_merchant_status(String(validation.get("reason", "不能购买")))
+		return
+	if network_session != null:
+		network_session.send_merchant_purchase(merchant.merchant_id, String(offer.get("offer_id", "")), offer_index)
+
+
+func _nearest_merchant_for_player(target_player: Player) -> MerchantEventState:
+	var best: MerchantEventState = null
+	var best_distance := INF
+	for merchant: MerchantEventState in merchant_events:
+		if not _is_player_in_merchant_range(target_player, merchant):
+			continue
+		var distance := target_player.position.distance_squared_to(merchant.position)
+		if distance < best_distance:
+			best_distance = distance
+			best = merchant
+	return best
+
+
+func _is_player_in_merchant_range(target_player: Player, merchant: MerchantEventState) -> bool:
+	var radius := merchant.radius + MERCHANT_INTERACT_RADIUS_PADDING
+	return target_player.position.distance_squared_to(merchant.position) <= radius * radius
+
+
+func _merchant_by_id(merchant_id: int) -> MerchantEventState:
+	for merchant: MerchantEventState in merchant_events:
+		if merchant.merchant_id == merchant_id:
+			return merchant
+	return null
+
+
+func _ensure_merchant_offers(peer_id: int, merchant: MerchantEventState) -> Array:
+	return merchant_shop.ensure_offers(peer_id, merchant)
+
+
+func _merchant_offer_validation(peer_id: int, merchant: MerchantEventState, offer: Dictionary) -> Dictionary:
+	if merchant == null:
+		return {"can_buy": false, "reason": "商人已经离开"}
+	var target_player := players.get(peer_id, null) as Player
+	var loadout = _ensure_player_loadout(peer_id)
+	var upgrade_state = _ensure_player_upgrade_state(peer_id)
+	return MerchantCatalog.validate_offer(
+		offer,
+		_gold_for_peer(peer_id),
+		target_player,
+		_is_peer_active_in_current_run(peer_id),
+		target_player != null and _is_player_in_merchant_range(target_player, merchant),
+		merchant_shop.is_in_cooldown(peer_id),
+		merchant_shop.has_purchased(peer_id, String(offer.get("offer_id", ""))),
+		MerchantCatalog.weapon_level_options(loadout).size(),
+		MerchantCatalog.passive_training_options(upgrade_state).size()
+	)
+
+
+func _apply_merchant_purchase(peer_id: int, merchant_id: int, offer_id: String, offer_index: int) -> bool:
+	var merchant: MerchantEventState = _merchant_by_id(merchant_id)
+	if merchant == null:
+		return false
+	var offers := _ensure_merchant_offers(peer_id, merchant)
+	if offer_index < 0 or offer_index >= offers.size():
+		return false
+	var offer: Dictionary = offers[offer_index]
+	if String(offer.get("offer_id", "")) != offer_id:
+		return false
+	var validation := _merchant_offer_validation(peer_id, merchant, offer)
+	if not bool(validation.get("can_buy", false)):
+		return false
+	if not _try_spend_gold(peer_id, int(offer.get("price", 0))):
+		return false
+	var applied := _apply_merchant_offer_effect(peer_id, offer)
+	if not applied:
+		_grant_gold_to_peer(peer_id, int(offer.get("price", 0)))
+		return false
+	merchant_shop.mark_purchased(peer_id, offer_id)
+	_add_visual_effect(merchant.position, Color(1.0, 0.76, 0.24, 0.68), 0.22, 18.0, 72.0, "burst")
+	_play_feedback_sound("power", 0.14)
+	_broadcast_world_snapshot_now()
+	return true
+
+
+func _apply_merchant_offer_effect(peer_id: int, offer: Dictionary) -> bool:
+	var target_player := players.get(peer_id, null) as Player
+	return MerchantCatalog.apply_offer_effect(
+		offer,
+		target_player,
+		_ensure_player_loadout(peer_id),
+		_ensure_player_upgrade_state(peer_id),
+		relics,
+		rng
+	)
+
+
 func _create_ui() -> void:
 	hud_layer = CanvasLayer.new()
 	add_child(hud_layer)
@@ -1313,6 +1681,9 @@ func _create_ui() -> void:
 	upgrade_buttons_box = VBoxContainer.new()
 	upgrade_buttons_box.add_theme_constant_override("separation", 8)
 	upgrade_box.add_child(upgrade_buttons_box)
+
+	merchant_panel_view.create(root)
+	merchant_panel_view.purchase_requested.connect(_request_merchant_purchase)
 
 	game_over_overlay = _make_overlay(root)
 	var game_over_center := CenterContainer.new()
@@ -1485,6 +1856,7 @@ func _setup_network_session() -> void:
 	network_session.peer_left.connect(_on_network_peer_left)
 	network_session.world_snapshot_received.connect(_on_world_snapshot_received)
 	network_session.upgrade_choice_received.connect(_on_network_upgrade_choice_received)
+	network_session.merchant_purchase_received.connect(_on_network_merchant_purchase_received)
 	network_session.restart_requested.connect(_on_network_restart_requested)
 	network_session.lobby_ready_received.connect(_on_network_lobby_ready_received)
 	network_session.game_start_received.connect(_on_network_game_start_received)
@@ -1502,7 +1874,9 @@ func _setup_player() -> void:
 	players.clear()
 	player_weapon_loadouts.clear()
 	player_upgrade_states.clear()
+	gold_wallets.reset()
 	players[SERVER_PEER_ID] = player
+	gold_wallets.ensure_peer(SERVER_PEER_ID)
 	player.set_display_color(_player_color(SERVER_PEER_ID))
 	_ensure_player_loadout(SERVER_PEER_ID)
 	_ensure_player_upgrade_state(SERVER_PEER_ID)
@@ -1937,6 +2311,17 @@ func _on_network_upgrade_choice_received(peer_id: int, choice_index: int) -> voi
 		network_status_label.text = "玩家 %d 选择了升级" % peer_id
 
 
+func _on_network_merchant_purchase_received(peer_id: int, merchant_id: int, offer_id: String, offer_index: int) -> void:
+	if network_session != null and network_session.is_client():
+		return
+	var purchased := _apply_merchant_purchase(peer_id, merchant_id, offer_id, offer_index)
+	if purchased and network_status_label != null and network_session != null and network_session.is_host():
+		network_status_label.text = "玩家 %d 购买了商人商品" % peer_id
+	if peer_id == local_peer_id:
+		_set_merchant_status("购买成功" if purchased else "购买失败")
+		_refresh_merchant_panel()
+
+
 func _on_network_restart_requested(_peer_id: int) -> void:
 	if network_session != null and network_session.is_client():
 		return
@@ -1990,6 +2375,7 @@ func _ensure_player(peer_id: int) -> Player:
 	new_player.set_display_color(_player_color(peer_id))
 	_ensure_player_loadout(peer_id)
 	_ensure_player_upgrade_state(peer_id)
+	gold_wallets.ensure_peer(peer_id)
 	return new_player
 
 
@@ -2000,6 +2386,8 @@ func _remove_player(peer_id: int) -> void:
 	players.erase(peer_id)
 	player_weapon_loadouts.erase(peer_id)
 	player_upgrade_states.erase(peer_id)
+	gold_wallets.remove_peer(peer_id)
+	merchant_shop.remove_peer(peer_id)
 	upgrade_choices_by_peer.erase(peer_id)
 	upgrade_selected_peer_ids.erase(peer_id)
 	if old_player != null and old_player != player:
@@ -2699,19 +3087,24 @@ func _clear_network_view_state() -> void:
 	zombies.clear()
 	bullets.clear()
 	xp_orbs.clear()
+	gold_orbs.clear()
 	reward_chests.clear()
 	supply_caches.clear()
 	holdout_events.clear()
+	merchant_events.clear()
 	visual_effects.clear()
 	upgrade_choices.clear()
 	upgrade_choices_by_peer.clear()
 	upgrade_selected_peer_ids.clear()
+	merchant_shop.reset()
+	gold_wallets.reset()
 	upgrade_reward_source = UpgradeCatalog.REWARD_LEVEL
 	upgrade_selection_timer = -1.0
 	zombie_grid.clear()
 	choosing_upgrade = false
 	synced_upgrade_choice_key = ""
 	upgrade_overlay.visible = false
+	_close_local_merchant_panel()
 	game_over_overlay.visible = false
 
 
@@ -2759,6 +3152,14 @@ func _make_world_snapshot() -> Dictionary:
 			"value": orb.value
 		})
 
+	var gold_data := []
+	for orb: GoldOrbState in gold_orbs:
+		gold_data.append({
+			"position": orb.position,
+			"value": orb.value,
+			"lifetime": orb.lifetime
+		})
+
 	var chests_data := []
 	for chest in reward_chests:
 		chests_data.append({
@@ -2785,6 +3186,16 @@ func _make_world_snapshot() -> Dictionary:
 			"progress": event.progress
 		})
 
+	var merchants_data := []
+	for merchant: MerchantEventState in merchant_events:
+		merchants_data.append({
+			"merchant_id": merchant.merchant_id,
+			"position": merchant.position,
+			"radius": merchant.radius,
+			"lifetime": merchant.lifetime,
+			"offer_seed": merchant.offer_seed
+		})
+
 	return {
 		"protocol_version": NetworkSessionResource.PROTOCOL_VERSION,
 		"host_network_state": network_state,
@@ -2798,6 +3209,7 @@ func _make_world_snapshot() -> Dictionary:
 		"level": level,
 		"xp": xp,
 		"xp_to_next": xp_to_next,
+		"player_gold": gold_wallets.serialize(),
 		"game_over": game_over,
 		"choosing_upgrade": choosing_upgrade,
 		"upgrade_reward_source": upgrade_reward_source,
@@ -2811,9 +3223,16 @@ func _make_world_snapshot() -> Dictionary:
 		"zombies": zombies_data,
 		"bullets": bullets_data,
 		"xp_orbs": xp_data,
+		"gold_orbs": gold_data,
 		"reward_chests": chests_data,
 		"supply_caches": supplies_data,
 		"holdout_events": holdouts_data,
+		"merchant_events": merchants_data,
+		"merchant_offers_by_peer": merchant_shop.serialize_offers(),
+		"merchant_purchases_by_peer": merchant_shop.serialize_purchases(),
+		"merchant_reopen_cooldowns": merchant_shop.serialize_cooldowns(),
+		"next_merchant_id": next_merchant_id,
+		"gold_drop_policy": gold_drop_policy.serialize(),
 		"weapon_status": _local_weapon_status_text(),
 		"relic_status": relics.status_text(),
 		"game_over_text": game_over_label.text if game_over_label != null else ""
@@ -2836,6 +3255,9 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 	level = int(snapshot.get("level", level))
 	xp = int(snapshot.get("xp", xp))
 	xp_to_next = int(snapshot.get("xp_to_next", xp_to_next))
+	gold_wallets.apply_snapshot(snapshot.get("player_gold", {}))
+	next_merchant_id = int(snapshot.get("next_merchant_id", next_merchant_id))
+	gold_drop_policy.apply_snapshot(snapshot.get("gold_drop_policy", {}))
 	game_over = bool(snapshot.get("game_over", false))
 	if not game_over:
 		local_run_recorded = false
@@ -2844,6 +3266,9 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 	upgrade_selection_timer = float(snapshot.get("upgrade_selection_timer", upgrade_selection_timer))
 	_apply_upgrade_choices_by_peer_snapshot(snapshot.get("upgrade_choices_by_peer", {}))
 	_apply_upgrade_selected_peer_ids_snapshot(snapshot.get("upgrade_selected_peer_ids", []))
+	merchant_shop.apply_offers_snapshot(snapshot.get("merchant_offers_by_peer", {}))
+	merchant_shop.apply_purchases_snapshot(snapshot.get("merchant_purchases_by_peer", {}))
+	merchant_shop.apply_cooldowns_snapshot(snapshot.get("merchant_reopen_cooldowns", {}))
 	spawn_director.wave_index = int(snapshot.get("wave_index", spawn_director.wave_index))
 	synced_weapon_status_text = String(snapshot.get("weapon_status", synced_weapon_status_text))
 	synced_relic_status_text = String(snapshot.get("relic_status", synced_relic_status_text))
@@ -2901,6 +3326,14 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 			int(orb_data.get("value", 1))
 		))
 
+	gold_orbs.clear()
+	for orb_data in snapshot.get("gold_orbs", []):
+		gold_orbs.append(GoldOrbState.new(
+			orb_data.get("position", Vector2.ZERO),
+			int(orb_data.get("value", 1)),
+			float(orb_data.get("lifetime", 45.0))
+		))
+
 	reward_chests.clear()
 	for chest_data in snapshot.get("reward_chests", []):
 		reward_chests.append(RewardChestState.new(
@@ -2928,6 +3361,16 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		event.progress = float(event_data.get("progress", 0.0))
 		holdout_events.append(event)
 
+	merchant_events.clear()
+	for merchant_data in snapshot.get("merchant_events", []):
+		merchant_events.append(MerchantEventState.new(
+			int(merchant_data.get("merchant_id", 0)),
+			merchant_data.get("position", Vector2.ZERO),
+			float(merchant_data.get("radius", MERCHANT_RADIUS)),
+			float(merchant_data.get("lifetime", MERCHANT_LIFETIME)),
+			int(merchant_data.get("offer_seed", 0))
+		))
+
 	if not run_started:
 		if lobby_overlay != null:
 			lobby_overlay.visible = true
@@ -2941,11 +3384,13 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 	elif network_status_label != null and _is_network_client():
 		network_status_label.text = "局内：已连接房主"
 	if choosing_upgrade and _has_local_active_player():
+		_close_local_merchant_panel()
 		_show_current_local_upgrade_choices()
 	else:
 		upgrade_overlay.visible = false
 		upgrade_choices.clear()
 		synced_upgrade_choice_key = ""
+		_update_local_merchant_ui(0.0)
 	game_over_overlay.visible = game_over
 	if game_over and game_over_label != null:
 		_record_synced_run_if_needed(was_game_over)
@@ -3083,9 +3528,10 @@ func _update_hud() -> void:
 	var seconds := int(elapsed)
 	var time_text := "%02d:%02d" % [floori(seconds / 60.0), seconds % 60]
 	var player_state := _hud_player_state(status_player)
-	hud_label.text = "等级 %d  击杀 %d  波次 %d  生存 %s  玩家 %d  状态 %s  角色 %s" % [
+	hud_label.text = "等级 %d  击杀 %d  金币 %d  波次 %d  生存 %s  玩家 %d  状态 %s  角色 %s" % [
 		level,
 		kills,
+		_gold_for_peer(local_peer_id),
 		spawn_director.wave_index,
 		time_text,
 		players.size(),
@@ -3126,6 +3572,8 @@ func _status_hint_text(status_player: Player) -> String:
 		return "等待下一局：房主重开后加入。"
 	if status_player.spawn_protection_timer > 0.0:
 		return "入场保护中：%.0f 秒内不会受到伤害。" % ceilf(status_player.spawn_protection_timer)
+	if not _is_local_merchant_panel_open() and _nearest_merchant_for_player(status_player) != null and not merchant_shop.is_in_cooldown(local_peer_id):
+		return "靠近流浪商人，按 E 交易。"
 	if status_player.downed:
 		var revive_percent := int(round(clampf(status_player.revive_progress, 0.0, 1.0) * 100.0))
 		var reviver_count := _reviver_count_nearby(status_player)
@@ -3188,6 +3636,8 @@ func _restart_game() -> void:
 	local_run_recorded = false
 	player_weapon_loadouts.clear()
 	player_upgrade_states.clear()
+	gold_wallets.reset()
+	merchant_shop.reset()
 	weapon_loadout.reset(selected_starting_weapon)
 	for peer_id in players.keys():
 		var active_player := players[peer_id] as Player
@@ -3199,13 +3649,16 @@ func _restart_game() -> void:
 		loadout.reset(selected_starting_weapon)
 		player_weapon_loadouts[int(peer_id)] = loadout
 		player_upgrade_states[int(peer_id)] = UpgradeState.new()
+		gold_wallets.ensure_peer(int(peer_id))
 	_refresh_player_identity_markers()
 	zombies.clear()
 	bullets.clear()
 	xp_orbs.clear()
+	gold_orbs.clear()
 	reward_chests.clear()
 	supply_caches.clear()
 	holdout_events.clear()
+	merchant_events.clear()
 	visual_effects.clear()
 	upgrade_choices.clear()
 	upgrade_choices_by_peer.clear()
@@ -3221,6 +3674,11 @@ func _restart_game() -> void:
 	hud_refresh_timer = 0.0
 	network_input_timer = 0.0
 	world_snapshot_timer = 0.0
+	gold_drop_policy.reset()
+	next_merchant_id = 1
+	local_open_merchant_id = -1
+	merchant_status_message = ""
+	merchant_status_timer = 0.0
 	elapsed = 0.0
 	kills = 0
 	level = 1
@@ -3232,6 +3690,7 @@ func _restart_game() -> void:
 	synced_weapon_status_text = ""
 	synced_relic_status_text = ""
 	upgrade_overlay.visible = false
+	_close_local_merchant_panel()
 	game_over_overlay.visible = false
 	player = players.get(local_peer_id, players.get(SERVER_PEER_ID, player)) as Player
 	if camera != null and player != null:
@@ -3354,6 +3813,29 @@ func _draw_supply_cache(supply) -> void:
 			draw_circle(position, 7.0, Color(0.08, 0.06, 0.04))
 			draw_line(position + Vector2(4.0, -6.0), position + Vector2(10.0, -12.0), Color.WHITE, 2.0)
 	draw_arc(position, supply.radius + 8.0, 0.0, TAU, 24, Color(color.r, color.g, color.b, 0.72), 2.0)
+
+
+func _draw_merchant_event(merchant: MerchantEventState) -> void:
+	var position := merchant.position
+	var active := local_open_merchant_id == merchant.merchant_id
+	var ring_color := Color(1.0, 0.76, 0.24, 0.92) if active else Color(0.95, 0.68, 0.22, 0.72)
+	draw_circle(position, merchant.radius, Color(0.95, 0.68, 0.22, 0.055))
+	draw_arc(position, merchant.radius, 0.0, TAU, 56, ring_color, 3.0)
+	draw_arc(
+		position,
+		merchant.radius + 7.0,
+		-PI * 0.5,
+		-PI * 0.5 + TAU * clampf(merchant.lifetime / MERCHANT_LIFETIME, 0.0, 1.0),
+		56,
+		Color(1.0, 0.9, 0.42, 0.72),
+		4.0
+	)
+	draw_circle(position, 19.0, Color(0.18, 0.12, 0.08))
+	draw_circle(position, 14.0, Color(0.86, 0.54, 0.2))
+	draw_rect(Rect2(position + Vector2(-13.0, -2.0), Vector2(26.0, 15.0)), Color(0.32, 0.18, 0.08), true)
+	draw_circle(position + Vector2(-6.0, -5.0), 2.2, Color(1.0, 0.92, 0.52))
+	draw_circle(position + Vector2(6.0, -5.0), 2.2, Color(1.0, 0.92, 0.52))
+	draw_arc(position, 27.0, 0.0, TAU, 24, Color(1.0, 0.76, 0.24, 0.62), 2.0)
 
 
 func _supply_color(kind: String) -> Color:

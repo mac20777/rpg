@@ -11,6 +11,8 @@
 - `scripts/upgrades/` 放升级池、升级选项生成和后续稀有度/前置条件规则。
 - `scripts/relics/` 放遗物状态和遗物效果钩子。
 - `scripts/events/` 放地图事件生成节奏，例如补给箱和守点事件。
+- `scripts/economy/` 放局内经济状态和掉落策略，例如金币钱包、金币掉落预算。
+- `scripts/merchants/` 放商人商品、商品锁定、购买记录和交易规则。
 - `scripts/feedback/` 放音效、屏幕反馈等不改变玩法规则的反馈模块。
 - `scripts/meta/` 放局外进度、解锁条件、存档读写。
 - 后续新增系统时优先新建独立模块，再由 `scripts/game/game.gd` 调用，避免继续把全部逻辑塞进主脚本。
@@ -80,6 +82,33 @@
 - 控制补给箱和守点事件的生成节奏。
 - 根据玩家血量调整补给类型权重。
 - 不直接应用补给效果，具体效果由主游戏场景在拾取时调用。
+
+### 经济系统
+
+- `scripts/economy/gold_wallets.gd`
+- `scripts/economy/gold_drop_policy.gd`
+
+职责：
+
+- `GoldWallets` 维护每名玩家的本局金币余额，提供发放、扣费、序列化和快照恢复。
+- `GoldDropPolicy` 维护普通怪金币掉落概率、掉落预算和金币物体上限相关规则。
+- `scripts/game/game.gd` 只负责在击杀、拾取、宝箱和守点完成时调用经济模块，不直接承载经济平衡规则。
+
+### 流浪商人
+
+- `scripts/entities/merchant_event_state.gd`
+- `scripts/merchants/merchant_catalog.gd`
+- `scripts/merchants/merchant_panel_view.gd`
+- `scripts/merchants/merchant_shop_state.gd`
+
+职责：
+
+- `MerchantEventState` 只保存商人的位置、交易范围、剩余时间、唯一 ID 和商品种子。
+- `MerchantCatalog` 定义商品、价格、购买条件和购买效果。
+- `MerchantPanelView` 创建和刷新商人交易面板，并通过信号把购买请求交回主流程。
+- `MerchantShopState` 维护按玩家锁定的商品列表、已购买记录和受击后的重开冷却。
+- 主游戏脚本只负责商人事件生成、绘制、打开/关闭本地交易 UI 和网络购买请求转发。
+- 商人 UI 不设置 `choosing_upgrade`，多人游戏中不会暂停全队。
 
 ### 武器系统
 
