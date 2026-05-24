@@ -8,7 +8,7 @@ var lifetime: float
 var progress := 0.0
 
 
-func _init(new_position: Vector2, new_radius := 112.0, new_required_time := 20.0, new_lifetime := 90.0) -> void:
+func _init(new_position: Vector2, new_radius := 112.0, new_required_time := 16.0, new_lifetime := 90.0) -> void:
 	position = new_position
 	radius = new_radius
 	required_time = new_required_time

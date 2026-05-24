@@ -5,14 +5,14 @@ const SUPPLY_HEAL := "heal"
 const SUPPLY_MAGNET := "magnet"
 const SUPPLY_BOMB := "bomb"
 
-const FIRST_SUPPLY_TIME := 28.0
-const MIN_SUPPLY_INTERVAL := 42.0
-const MAX_SUPPLY_INTERVAL := 58.0
+const FIRST_SUPPLY_TIME := 18.0
+const MIN_SUPPLY_INTERVAL := 34.0
+const MAX_SUPPLY_INTERVAL := 46.0
 const MAX_ACTIVE_SUPPLIES := 3
 
-const FIRST_HOLDOUT_TIME := 95.0
-const MIN_HOLDOUT_INTERVAL := 120.0
-const MAX_HOLDOUT_INTERVAL := 150.0
+const FIRST_HOLDOUT_TIME := 82.0
+const MIN_HOLDOUT_INTERVAL := 108.0
+const MAX_HOLDOUT_INTERVAL := 136.0
 const MAX_ACTIVE_HOLDOUTS := 1
 
 var supply_timer := 0.0
@@ -47,9 +47,9 @@ func update(delta: float, active_supply_count: int, active_holdout_count: int, h
 
 
 func _choose_supply_kind(hp_ratio: float, rng: RandomNumberGenerator) -> String:
-	var heal_weight := 0.75
-	var magnet_weight := 0.85
-	var bomb_weight := 0.7
+	var heal_weight := 0.65
+	var magnet_weight := 1.05
+	var bomb_weight := 0.9
 	if hp_ratio < 0.45:
 		heal_weight += 0.9
 	var total_weight := heal_weight + magnet_weight + bomb_weight

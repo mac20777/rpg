@@ -19,6 +19,7 @@ var outline_color := Color(0.06, 0.13, 0.14)
 var downed := false
 var revive_progress := 0.0
 var down_count := 0
+var spawn_protection_timer := 0.0
 var identity_label_text := ""
 var is_local_player := false
 var identity_label: Label
@@ -33,6 +34,7 @@ func reset(spawn_position: Vector2, character_id := "survivor") -> void:
 	downed = false
 	revive_progress = 0.0
 	down_count = 0
+	spawn_protection_timer = 0.0
 	queue_redraw()
 
 
@@ -116,7 +118,7 @@ func set_aim_direction(new_direction: Vector2) -> void:
 
 
 func take_damage(amount: float) -> void:
-	if downed:
+	if downed or spawn_protection_timer > 0.0:
 		return
 	hp -= amount
 	if hp <= 0.0:
@@ -149,6 +151,18 @@ func revive(health_ratio := 0.35) -> void:
 
 func is_combat_active() -> bool:
 	return hp > 0.0 and not downed
+
+
+func grant_spawn_protection(duration: float) -> void:
+	spawn_protection_timer = maxf(spawn_protection_timer, duration)
+	queue_redraw()
+
+
+func update_status_timers(delta: float) -> void:
+	if spawn_protection_timer <= 0.0:
+		return
+	spawn_protection_timer = maxf(spawn_protection_timer - delta, 0.0)
+	queue_redraw()
 
 
 func set_display_color(new_body_color: Color) -> void:
@@ -235,4 +249,7 @@ func _draw() -> void:
 	draw_circle(Vector2.ZERO, RADIUS, current_body_color)
 	if downed:
 		draw_arc(Vector2.ZERO, RADIUS + 10.0, -PI * 0.5, -PI * 0.5 + TAU * clampf(revive_progress, 0.0, 1.0), 32, Color(0.35, 0.95, 0.68), 4.0)
+	elif spawn_protection_timer > 0.0:
+		draw_arc(Vector2.ZERO, RADIUS + 13.0, 0.0, TAU, 48, Color(0.45, 0.9, 1.0, 0.82), 3.0)
+		draw_circle(Vector2.ZERO, RADIUS + 7.0, Color(0.45, 0.9, 1.0, 0.12))
 	draw_line(Vector2.ZERO, aim_direction * 28.0, Color(0.95, 0.95, 0.85), 5.0)

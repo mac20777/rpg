@@ -127,6 +127,7 @@ static func roll_choices(
 	if options.is_empty():
 		options.append(FALLBACK_UPGRADE.duplicate(true))
 	var selected := []
+	_append_priority_choices(selected, options, rng, weapon_loadout, player_level, elapsed, reward_source)
 	while selected.size() < count and not options.is_empty():
 		var option_index := _weighted_option_index(rng, options, player_level, elapsed, reward_source)
 		selected.append(options[option_index])
@@ -203,6 +204,80 @@ static func _collect_valid_options(weapon_loadout, upgrade_state, relics, player
 	return options
 
 
+static func _append_priority_choices(
+	selected: Array,
+	options: Array,
+	rng: RandomNumberGenerator,
+	weapon_loadout,
+	player_level: int,
+	elapsed: float,
+	reward_source: String
+) -> void:
+	if reward_source == REWARD_CHEST:
+		if _take_matching_option(selected, options, rng, player_level, elapsed, reward_source, ["weapon_evolve"]):
+			return
+		_take_matching_option(selected, options, rng, player_level, elapsed, reward_source, ["relic", "weapon_level", "weapon_add"])
+		return
+
+	if player_level <= 4 and _weapon_count(weapon_loadout) < 2:
+		_take_matching_option(selected, options, rng, player_level, elapsed, reward_source, ["weapon_add"])
+
+	if player_level <= 6:
+		_take_matching_option(selected, options, rng, player_level, elapsed, reward_source, ["weapon_level"])
+
+
+static func _take_matching_option(
+	selected: Array,
+	options: Array,
+	rng: RandomNumberGenerator,
+	player_level: int,
+	elapsed: float,
+	reward_source: String,
+	upgrade_types: Array
+) -> bool:
+	if options.is_empty() or selected.size() >= 3:
+		return false
+	var option_index := _weighted_matching_option_index(rng, options, player_level, elapsed, reward_source, upgrade_types)
+	if option_index < 0:
+		return false
+	selected.append(options[option_index])
+	options.remove_at(option_index)
+	return true
+
+
+static func _weighted_matching_option_index(
+	rng: RandomNumberGenerator,
+	options: Array,
+	player_level: int,
+	elapsed: float,
+	reward_source: String,
+	upgrade_types: Array
+) -> int:
+	var total_weight := 0.0
+	for option in options:
+		if not upgrade_types.has(String(option.get("type", ""))):
+			continue
+		total_weight += _option_weight(option, player_level, elapsed, reward_source)
+	if total_weight <= 0.0:
+		return -1
+
+	var roll := rng.randf() * total_weight
+	for option_index in range(options.size()):
+		var option: Dictionary = options[option_index]
+		if not upgrade_types.has(String(option.get("type", ""))):
+			continue
+		roll -= _option_weight(option, player_level, elapsed, reward_source)
+		if roll <= 0.0:
+			return option_index
+	return -1
+
+
+static func _weapon_count(weapon_loadout) -> int:
+	if weapon_loadout == null:
+		return 0
+	return weapon_loadout.weapons.size()
+
+
 static func _requirements_met(
 	option: Dictionary,
 	weapon_loadout,
@@ -248,19 +323,20 @@ static func _weighted_option_index(rng: RandomNumberGenerator, options: Array, p
 
 static func _option_weight(option: Dictionary, player_level: int, elapsed: float, reward_source: String) -> float:
 	var base_weight := _rarity_weight(option.get("rarity", RARITY_COMMON), player_level, elapsed, reward_source)
+	var opening_bonus := 1.0 + maxf(1.0 - elapsed / 300.0, 0.0) * 0.55
 	match String(option.get("type", "")):
 		"weapon_level":
-			return base_weight * 2.15
+			return base_weight * (3.0 if reward_source == REWARD_CHEST else 2.55 * opening_bonus)
 		"weapon_add":
-			return base_weight * 1.75
+			return base_weight * (2.45 if reward_source == REWARD_CHEST else 2.25 * opening_bonus)
 		"weapon_evolve":
-			return base_weight * 1.65
+			return base_weight * (4.0 if reward_source == REWARD_CHEST else 2.35)
 		"relic":
-			return base_weight * 1.18
+			return base_weight * (2.35 if reward_source == REWARD_CHEST else 1.35)
 		"passive":
-			return base_weight * 0.82
+			return base_weight * (0.38 if reward_source == REWARD_CHEST else 0.68)
 		"heal":
-			return base_weight * 0.45
+			return base_weight * 0.35
 	return base_weight
 
 
@@ -268,11 +344,11 @@ static func _rarity_weight(rarity: String, player_level: int, elapsed: float, re
 	if reward_source == REWARD_CHEST:
 		match rarity:
 			RARITY_UNCOMMON:
-				return 1.25
+				return 1.35
 			RARITY_RARE:
-				return 0.86 + minf(elapsed / 420.0, 1.0) * 0.24
+				return 1.15 + minf(elapsed / 360.0, 1.0) * 0.35
 			_:
-				return 0.24
+				return 0.12
 
 	var time_bonus := minf(elapsed / 360.0, 1.0)
 	var level_bonus := minf(float(maxi(player_level - 3, 0)) / 12.0, 1.0)

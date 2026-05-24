@@ -34,6 +34,10 @@ func fire(player, target, bullets: Array, rng: RandomNumberGenerator) -> void:
 	var direction: Vector2 = WeaponHelpers.direction_to_target(player, target)
 	direction = direction.rotated(rng.randf_range(-0.04, 0.04))
 	player.set_aim_direction(direction)
+	if evolved:
+		_fire_magnetic_storm(player, direction, bullets)
+		return
+
 	var damage: float = player.damage * (0.66 + float(level - 1) * 0.12)
 	var pierce_left := 3 + level
 	WeaponHelpers.spawn_bullet(
@@ -51,6 +55,8 @@ func fire(player, target, bullets: Array, rng: RandomNumberGenerator) -> void:
 
 func cooldown(player) -> float:
 	var reload_multiplier: float = clampf(player.fire_interval / 0.45, 0.45, 1.0)
+	if evolved:
+		return maxf(0.82 * reload_multiplier, 0.42)
 	return maxf((1.24 - float(level - 1) * 0.07) * reload_multiplier, 0.58)
 
 
@@ -71,9 +77,27 @@ func upgrade_desc() -> String:
 
 
 func can_evolve() -> bool:
-	return false
+	return not evolved and level >= max_level
 
 
 func evolve(new_evolution_id: String) -> void:
 	evolved = true
 	evolution_id = new_evolution_id
+	title = "磁暴场"
+	timer = 0.0
+
+
+func _fire_magnetic_storm(player, direction: Vector2, bullets: Array) -> void:
+	for angle_offset in [-0.28, -0.14, 0.0, 0.14, 0.28]:
+		var arc_direction := direction.rotated(angle_offset)
+		WeaponHelpers.spawn_bullet(
+			bullets,
+			player.position + arc_direction * 26.0,
+			arc_direction,
+			1050.0,
+			player.damage * 0.72,
+			0.9,
+			4.9,
+			8,
+			Color(0.46, 1.0, 0.96)
+		)

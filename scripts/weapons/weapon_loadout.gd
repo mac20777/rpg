@@ -40,6 +40,24 @@ const EVOLUTION_DEFINITIONS := [
 		"title": "进化：暗影飞刃",
 		"desc": "飞刀满级 + 第五发遗物，改为三向高穿透飞刃",
 		"requires": {"relic": "fifth_shot_crit"}
+	},
+	{
+		"id": "meteor_barrage",
+		"type": "weapon_evolve",
+		"rarity": "rare",
+		"weapon_id": FLAME,
+		"title": "进化：陨石雨",
+		"desc": "火球满级 + 火力强化 4 级，改为连续投射多枚巨大火球",
+		"requires": {"passive": {"damage": 4}}
+	},
+	{
+		"id": "magnetic_storm",
+		"type": "weapon_evolve",
+		"rarity": "rare",
+		"weapon_id": LIGHTNING,
+		"title": "进化：磁暴场",
+		"desc": "电弧满级 + 磁力背包 4 级，改为扇形多道穿透电束",
+		"requires": {"passive": {"pickup": 4}}
 	}
 ]
 

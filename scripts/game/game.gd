@@ -22,7 +22,8 @@ const PLAYER_RADIUS := 16.0
 const XP_RADIUS := 6.0
 const CHEST_PICKUP_RADIUS := 34.0
 const SUPPLY_PICKUP_RADIUS := 34.0
-const SUPPLY_BOMB_RADIUS := 460.0
+const SUPPLY_BOMB_RADIUS := 500.0
+const INITIAL_XP_TO_NEXT := 5
 const PLAYER_XP_COLLISION_RADIUS := PLAYER_RADIUS + XP_RADIUS
 const PLAYER_XP_COLLISION_RADIUS_SQ := PLAYER_XP_COLLISION_RADIUS * PLAYER_XP_COLLISION_RADIUS
 const COLLISION_CELL_SIZE := 96.0
@@ -45,9 +46,14 @@ const LOBBY_AUTO_START_DELAY := 3.0
 const UPGRADE_SELECTION_TIME_LIMIT := 20.0
 const REVIVE_RADIUS := 72.0
 const REVIVE_RADIUS_SQ := REVIVE_RADIUS * REVIVE_RADIUS
-const REVIVE_BASE_TIME := 3.5
-const REVIVE_DOWN_PENALTY := 1.0
+const REVIVE_BASE_TIME := 2.2
+const REVIVE_DOWN_PENALTY := 0.45
+const REVIVE_EXTRA_HELPER_SPEED := 0.55
+const REVIVE_MAX_SPEED_MULTIPLIER := 2.6
+const REVIVE_PROGRESS_DECAY := 0.12
 const REVIVE_HEALTH_RATIO := 0.35
+const JOIN_SPAWN_PROTECTION_TIME := 5.0
+const JOIN_SAFE_SPAWN_MIN_DISTANCE := 180.0
 const NET_STATE_OFFLINE_LOBBY := "OfflineLobby"
 const NET_STATE_OFFLINE_RUNNING := "OfflineRunning"
 const NET_STATE_HOST_LOBBY := "HostLobby"
@@ -144,7 +150,7 @@ var elapsed := 0.0
 var kills := 0
 var level := 1
 var xp := 0
-var xp_to_next := 6
+var xp_to_next := INITIAL_XP_TO_NEXT
 var game_over := false
 var choosing_upgrade := false
 var selected_starting_weapon := WeaponLoadout.PISTOL
@@ -193,6 +199,8 @@ func _process(delta: float) -> void:
 	_refresh_network_state()
 	_update_room_advertisement_state()
 	_update_debug_overlay()
+	if run_started and not choosing_upgrade and not game_over:
+		_update_player_status_timers(delta)
 	if _is_lobby_state():
 		_update_lobby_network(delta)
 		if player != null:
@@ -351,6 +359,13 @@ func _update_players(delta: float) -> void:
 		active_player.update_movement_from_input(delta, arena_rect, input_state)
 
 
+func _update_player_status_timers(delta: float) -> void:
+	for active_player in players.values():
+		var typed_player := active_player as Player
+		if typed_player != null:
+			typed_player.update_status_timers(delta)
+
+
 func _update_map_events(delta: float) -> void:
 	var hp_ratio := _lowest_player_hp_ratio()
 	var event_requests := map_event_director.update(delta, supply_caches.size(), holdout_events.size(), hp_ratio, rng)
@@ -499,9 +514,11 @@ func _update_revives(delta: float) -> void:
 		var downed_player := active_player as Player
 		if downed_player == null or not downed_player.downed:
 			continue
-		if _has_reviver_nearby(downed_player):
+		var reviver_count := _reviver_count_nearby(downed_player)
+		if reviver_count > 0:
 			var required_time := _revive_required_time(downed_player)
-			downed_player.revive_progress = minf(downed_player.revive_progress + delta / required_time, 1.0)
+			var speed_multiplier := _revive_speed_multiplier(reviver_count)
+			downed_player.revive_progress = minf(downed_player.revive_progress + delta * speed_multiplier / required_time, 1.0)
 			if downed_player.revive_progress >= 1.0:
 				downed_player.revive(REVIVE_HEALTH_RATIO)
 				_add_visual_effect(downed_player.position, Color(0.24, 0.92, 0.62, 0.7), 0.3, 20.0, 96.0, "burst")
@@ -509,7 +526,7 @@ func _update_revives(delta: float) -> void:
 			else:
 				downed_player.queue_redraw()
 		else:
-			downed_player.revive_progress = maxf(downed_player.revive_progress - delta * 0.22, 0.0)
+			downed_player.revive_progress = maxf(downed_player.revive_progress - delta * REVIVE_PROGRESS_DECAY, 0.0)
 			downed_player.queue_redraw()
 
 
@@ -793,7 +810,7 @@ func _update_supply_caches(delta: float) -> void:
 func _apply_supply_cache(supply, collecting_player: Player) -> void:
 	match supply.kind:
 		MapEventDirector.SUPPLY_HEAL:
-			collecting_player.heal(maxf(45.0, collecting_player.max_hp * 0.35))
+			collecting_player.heal(maxf(55.0, collecting_player.max_hp * 0.45))
 			_add_visual_effect(supply.position, Color(0.18, 0.86, 0.45, 0.66), 0.24, 14.0, 54.0, "ring")
 			_play_feedback_sound("pickup", 0.05)
 		MapEventDirector.SUPPLY_MAGNET:
@@ -801,7 +818,7 @@ func _apply_supply_cache(supply, collecting_player: Player) -> void:
 			_add_visual_effect(supply.position, Color(0.25, 0.78, 1.0, 0.66), 0.24, 14.0, 64.0, "ring")
 			_play_feedback_sound("pickup", 0.05)
 		MapEventDirector.SUPPLY_BOMB:
-			_damage_zombies_from_supply(collecting_player.position, SUPPLY_BOMB_RADIUS, 180.0 + elapsed * 0.08)
+			_damage_zombies_from_supply(collecting_player.position, SUPPLY_BOMB_RADIUS, 240.0 + elapsed * 0.11)
 			_add_visual_effect(collecting_player.position, Color(1.0, 0.46, 0.16, 0.5), 0.32, 32.0, 150.0, "burst")
 			_play_feedback_sound("boom", 0.12)
 	_update_hud()
@@ -878,11 +895,17 @@ func _check_level_up() -> void:
 		return
 	xp -= xp_to_next
 	level += 1
-	xp_to_next = int(ceil(float(xp_to_next) * 1.35 + 2.0))
+	xp_to_next = _next_xp_requirement(level, xp_to_next)
 	_add_visual_effect(_team_focus_position(), Color(0.35, 0.95, 1.0, 0.72), 0.34, 26.0, 118.0, "burst")
 	_play_feedback_sound("level", 0.18)
 	choosing_upgrade = true
 	_show_upgrade_choices(UpgradeCatalog.REWARD_LEVEL)
+
+
+func _next_xp_requirement(current_level: int, previous_requirement: int) -> int:
+	var growth := 1.2 if current_level < 6 else (1.25 if current_level < 12 else 1.3)
+	var flat_bonus := 1.0 + maxf(float(current_level - 5), 0.0) * 0.25
+	return int(ceil(float(previous_requirement) * growth + flat_bonus))
 
 
 func _show_upgrade_choices(reward_source := UpgradeCatalog.REWARD_LEVEL) -> void:
@@ -893,6 +916,9 @@ func _show_upgrade_choices(reward_source := UpgradeCatalog.REWARD_LEVEL) -> void
 	upgrade_selected_peer_ids.clear()
 	for peer_id in _upgrade_participant_peer_ids():
 		upgrade_choices_by_peer[peer_id] = _roll_upgrade_choices_for_peer(peer_id, reward_source)
+	if upgrade_choices_by_peer.is_empty():
+		_complete_upgrade_phase()
+		return
 	_show_current_local_upgrade_choices()
 	_broadcast_world_snapshot_now()
 
@@ -915,9 +941,10 @@ func _update_upgrade_selection(delta: float) -> void:
 	if upgrade_selection_timer > 0.0:
 		return
 	var pending_peer_ids := []
-	for peer_id in _upgrade_participant_peer_ids():
-		if not upgrade_selected_peer_ids.has(peer_id):
-			pending_peer_ids.append(peer_id)
+	for peer_id in upgrade_choices_by_peer.keys():
+		var peer_int := int(peer_id)
+		if not upgrade_selected_peer_ids.has(peer_int):
+			pending_peer_ids.append(peer_int)
 	for peer_id in pending_peer_ids:
 		if choosing_upgrade:
 			_apply_upgrade_for_peer(int(peer_id), 0)
@@ -954,13 +981,12 @@ func _show_local_upgrade_choices(title: String, hint: String, choices: Array, al
 	for i in range(upgrade_choices.size()):
 		var upgrade: Dictionary = upgrade_choices[i]
 		var button := Button.new()
-		button.text = "%d. [%s] %s - %s" % [
-			i + 1,
-			UpgradeCatalog.rarity_label(upgrade.get("rarity", "common")),
-			upgrade["title"],
-			upgrade["desc"]
-		]
-		button.custom_minimum_size = Vector2(360.0, 44.0)
+		button.text = _upgrade_choice_button_text(i, upgrade)
+		button.custom_minimum_size = Vector2(540.0, 86.0)
+		button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		button.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		button.add_theme_font_size_override("font_size", 15)
+		_apply_upgrade_button_style(button, upgrade)
 		button.disabled = already_selected
 		button.pressed.connect(_choose_upgrade.bind(i))
 		upgrade_buttons_box.add_child(button)
@@ -968,12 +994,140 @@ func _show_local_upgrade_choices(title: String, hint: String, choices: Array, al
 	upgrade_overlay.visible = true
 
 
+func _upgrade_choice_button_text(index: int, upgrade: Dictionary) -> String:
+	var rarity := UpgradeCatalog.rarity_label(String(upgrade.get("rarity", "common")))
+	var type_label := _upgrade_type_label(String(upgrade.get("type", "")))
+	var title := String(upgrade.get("title", "未知强化"))
+	var desc := String(upgrade.get("desc", ""))
+	var flow_hint := _upgrade_flow_hint(String(upgrade.get("type", "")))
+	var requirement_text := _upgrade_requirement_text(upgrade)
+	var requirement_line := ""
+	if not requirement_text.is_empty():
+		requirement_line = "\n已满足：%s" % requirement_text
+	return "%d. [%s / %s] %s\n%s\n%s%s" % [
+		index + 1,
+		rarity,
+		type_label,
+		title,
+		desc,
+		flow_hint,
+		requirement_line
+	]
+
+
+func _upgrade_type_label(upgrade_type: String) -> String:
+	match upgrade_type:
+		"weapon_add":
+			return "新武器"
+		"weapon_level":
+			return "武器强化"
+		"weapon_evolve":
+			return "武器进化"
+		"relic":
+			return "遗物"
+		"passive":
+			return "被动"
+		"heal":
+			return "治疗"
+		_:
+			return "强化"
+
+
+func _upgrade_flow_hint(upgrade_type: String) -> String:
+	match upgrade_type:
+		"weapon_add":
+			return "构筑：增加一种自动攻击方式"
+		"weapon_level":
+			return "构筑：推进武器满级和后续进化"
+		"weapon_evolve":
+			return "构筑：解锁该武器最终形态"
+		"relic":
+			return "构筑：改变规则，可与武器联动"
+		"passive":
+			return "构筑：稳定成长，也是部分进化前置"
+		"heal":
+			return "构筑：立即恢复，适合危险局面"
+		_:
+			return "构筑：增强本局战斗能力"
+
+
+func _upgrade_requirement_text(upgrade: Dictionary) -> String:
+	var requires: Dictionary = upgrade.get("requires", {})
+	if requires.is_empty():
+		return ""
+	var parts := []
+	if requires.has("level"):
+		parts.append("等级 %d" % int(requires["level"]))
+	if requires.has("elapsed"):
+		parts.append("生存 %s" % _format_time(float(requires["elapsed"])))
+	if requires.has("weapon"):
+		parts.append("拥有%s" % weapon_loadout.weapon_title(String(requires["weapon"])))
+	if requires.has("relic"):
+		parts.append("遗物 %s" % relics.title_for(String(requires["relic"])))
+	if requires.has("passive"):
+		var passive_requirements: Dictionary = requires["passive"]
+		for passive_id in passive_requirements.keys():
+			parts.append("%s %d级" % [_passive_upgrade_title(String(passive_id)), int(passive_requirements[passive_id])])
+	return "，".join(parts)
+
+
+func _passive_upgrade_title(passive_id: String) -> String:
+	match passive_id:
+		"damage":
+			return "火力强化"
+		"fire_rate":
+			return "快速装填"
+		"speed":
+			return "轻装上阵"
+		"pickup":
+			return "磁力背包"
+		"health":
+			return "止痛针"
+		_:
+			return passive_id
+
+
+func _apply_upgrade_button_style(button: Button, upgrade: Dictionary) -> void:
+	var rarity_color := _upgrade_rarity_color(String(upgrade.get("rarity", "common")))
+	var normal_style := StyleBoxFlat.new()
+	normal_style.bg_color = Color(0.065, 0.072, 0.08, 0.96)
+	normal_style.border_color = rarity_color
+	normal_style.set_border_width_all(2)
+	normal_style.set_corner_radius_all(6)
+	var hover_style := normal_style.duplicate() as StyleBoxFlat
+	hover_style.bg_color = Color(0.09, 0.1, 0.11, 0.98)
+	var pressed_style := normal_style.duplicate() as StyleBoxFlat
+	pressed_style.bg_color = Color(0.045, 0.05, 0.058, 0.98)
+	var disabled_style := normal_style.duplicate() as StyleBoxFlat
+	disabled_style.bg_color = Color(0.045, 0.048, 0.052, 0.78)
+	disabled_style.border_color = Color(rarity_color.r, rarity_color.g, rarity_color.b, 0.45)
+	button.add_theme_stylebox_override("normal", normal_style)
+	button.add_theme_stylebox_override("hover", hover_style)
+	button.add_theme_stylebox_override("pressed", pressed_style)
+	button.add_theme_stylebox_override("disabled", disabled_style)
+	button.add_theme_color_override("font_color", Color(0.92, 0.95, 0.92))
+	button.add_theme_color_override("font_hover_color", Color.WHITE)
+	button.add_theme_color_override("font_pressed_color", Color(0.86, 0.9, 0.86))
+	button.add_theme_color_override("font_disabled_color", Color(0.62, 0.66, 0.64))
+
+
+func _upgrade_rarity_color(rarity: String) -> Color:
+	match rarity:
+		UpgradeCatalog.RARITY_UNCOMMON:
+			return Color(0.34, 0.76, 1.0)
+		UpgradeCatalog.RARITY_RARE:
+			return Color(1.0, 0.72, 0.2)
+		_:
+			return Color(0.54, 0.64, 0.6)
+
+
 func _choose_upgrade(index: int) -> void:
 	if _is_network_client():
-		if _has_local_active_player() and network_session != null:
+		var can_choose := _is_peer_eligible_for_upgrade(local_peer_id) and upgrade_choices_by_peer.has(local_peer_id)
+		if can_choose and network_session != null:
 			network_session.send_upgrade_choice(index)
 		if upgrade_hint_label != null:
-			upgrade_hint_label.text = "已提交选择，等待房主确认" if _has_local_active_player() else "观战中，不能选择升级"
+			upgrade_hint_label.text = "已提交选择，等待房主确认" if can_choose else "倒地或等待中，不能选择升级"
 		for child in upgrade_buttons_box.get_children():
 			var button := child as Button
 			if button != null:
@@ -985,7 +1139,9 @@ func _choose_upgrade(index: int) -> void:
 func _apply_upgrade_for_peer(peer_id: int, index: int) -> void:
 	if not choosing_upgrade:
 		return
-	if not _is_peer_active_in_current_run(peer_id):
+	if not upgrade_choices_by_peer.has(peer_id):
+		return
+	if not _is_peer_eligible_for_upgrade(peer_id):
 		return
 	if upgrade_selected_peer_ids.has(peer_id):
 		return
@@ -1013,9 +1169,13 @@ func _finish_upgrade_phase_if_complete() -> void:
 		return
 	if not choosing_upgrade:
 		return
-	for peer_id in _upgrade_participant_peer_ids():
-		if not upgrade_selected_peer_ids.has(peer_id):
+	for peer_id in upgrade_choices_by_peer.keys():
+		if not upgrade_selected_peer_ids.has(int(peer_id)):
 			return
+	_complete_upgrade_phase()
+
+
+func _complete_upgrade_phase() -> void:
 	choosing_upgrade = false
 	upgrade_selection_timer = -1.0
 	upgrade_overlay.visible = false
@@ -1130,7 +1290,7 @@ func _create_ui() -> void:
 	upgrade_center.set_anchors_preset(Control.PRESET_FULL_RECT)
 	upgrade_overlay.add_child(upgrade_center)
 	var upgrade_panel := PanelContainer.new()
-	upgrade_panel.custom_minimum_size = Vector2(460.0, 270.0)
+	upgrade_panel.custom_minimum_size = Vector2(620.0, 420.0)
 	upgrade_center.add_child(upgrade_panel)
 	var upgrade_margin := MarginContainer.new()
 	upgrade_margin.add_theme_constant_override("margin_left", 22)
@@ -1395,7 +1555,7 @@ func _has_local_active_player() -> bool:
 func _update_room_advertisement_state() -> void:
 	if network_session == null or not network_session.is_host():
 		return
-	var room_state := "running" if run_started else "lobby"
+	var room_state := "results" if game_over else ("running" if run_started else "lobby")
 	network_session.update_room_advertisement(room_state, players.size(), _room_name_text())
 
 
@@ -1426,7 +1586,7 @@ func _update_debug_overlay() -> void:
 func _debug_overlay_text() -> String:
 	var mode: String = network_session.mode if network_session != null else "none"
 	var peer_count: int = network_session.connected_peer_ids().size() if network_session != null else 1
-	var local_status := "观战" if waiting_peer_ids.has(local_peer_id) else "参战"
+	var local_status := "等待" if waiting_peer_ids.has(local_peer_id) else "参战"
 	if player != null and player.downed:
 		local_status = "倒地"
 	var ms_since_snapshot := 0
@@ -1720,13 +1880,30 @@ func _on_network_peer_joined(peer_id: int) -> void:
 		_refresh_player_identity_markers()
 		_update_lobby_ui()
 		_broadcast_world_snapshot_now()
+	elif not game_over:
+		_activate_joined_player_for_current_run(peer_id)
 	else:
 		waiting_peer_ids[peer_id] = true
 		if network_status_label != null:
-			network_status_label.text = "玩家 %d 正在观战，下一局加入" % peer_id
+			network_status_label.text = "玩家 %d 已加入，等待下一局" % peer_id
 		_broadcast_world_snapshot_now()
 	world_snapshot_timer = 0.0
 	_update_hud()
+
+
+func _activate_joined_player_for_current_run(peer_id: int) -> void:
+	waiting_peer_ids.erase(peer_id)
+	lobby_ready.erase(peer_id)
+	var joined_player := _ensure_player(peer_id)
+	joined_player.reset(_spawn_position_for_live_join(peer_id), selected_character)
+	joined_player.grant_spawn_protection(JOIN_SPAWN_PROTECTION_TIME)
+	_ensure_player_loadout(peer_id)
+	_ensure_player_upgrade_state(peer_id)
+	run_participant_peer_ids[peer_id] = true
+	_refresh_player_identity_markers()
+	if network_status_label != null:
+		network_status_label.text = "玩家 %d 已中途加入当前局" % peer_id
+	_broadcast_world_snapshot_now()
 
 
 func _on_network_peer_left(peer_id: int) -> void:
@@ -1905,6 +2082,45 @@ func _spawn_position_for_peer(peer_id: int) -> Vector2:
 	return _get_arena_rect().get_center() + offsets[slot]
 
 
+func _spawn_position_for_live_join(peer_id: int) -> Vector2:
+	var focus := _team_focus_position()
+	var slot := _player_visual_slot(peer_id)
+	var base_angle := float(slot) * TAU / maxf(float(PLAYER_COLORS.size()), 1.0)
+	var offsets := [Vector2.ZERO]
+	for radius in [92.0, 148.0, 220.0, 300.0]:
+		for step in range(8):
+			offsets.append(Vector2.RIGHT.rotated(base_angle + float(step) * TAU / 8.0) * radius)
+	var best_position := _clamp_spawn_position(focus)
+	var best_distance := -1.0
+	var safe_distance_sq := JOIN_SAFE_SPAWN_MIN_DISTANCE * JOIN_SAFE_SPAWN_MIN_DISTANCE
+	for offset in offsets:
+		var candidate := _clamp_spawn_position(focus + offset)
+		var zombie_distance := _nearest_zombie_distance_sq(candidate)
+		if zombie_distance >= safe_distance_sq:
+			return candidate
+		if zombie_distance > best_distance:
+			best_distance = zombie_distance
+			best_position = candidate
+	return best_position
+
+
+func _clamp_spawn_position(position: Vector2) -> Vector2:
+	var arena_rect := _get_arena_rect()
+	return Vector2(
+		clampf(position.x, arena_rect.position.x + PLAYER_RADIUS, arena_rect.end.x - PLAYER_RADIUS),
+		clampf(position.y, arena_rect.position.y + PLAYER_RADIUS, arena_rect.end.y - PLAYER_RADIUS)
+	)
+
+
+func _nearest_zombie_distance_sq(position: Vector2) -> float:
+	var closest_distance := INF
+	for zombie: ZombieState in zombies:
+		if zombie == null or zombie.dead:
+			continue
+		closest_distance = minf(closest_distance, zombie.position.distance_squared_to(position))
+	return closest_distance
+
+
 func _first_player() -> Player:
 	for active_player in players.values():
 		var typed_player := active_player as Player
@@ -1981,13 +2197,26 @@ func _are_all_players_downed() -> bool:
 
 
 func _has_reviver_nearby(downed_player: Player) -> bool:
-	for active_player in players.values():
-		var reviver := active_player as Player
+	return _reviver_count_nearby(downed_player) > 0
+
+
+func _reviver_count_nearby(downed_player: Player) -> int:
+	var count := 0
+	for peer_id in players.keys():
+		if waiting_peer_ids.has(int(peer_id)):
+			continue
+		var reviver := players[peer_id] as Player
 		if reviver == null or reviver == downed_player or not reviver.is_combat_active():
 			continue
 		if reviver.position.distance_squared_to(downed_player.position) <= REVIVE_RADIUS_SQ:
-			return true
-	return false
+			count += 1
+	return count
+
+
+func _revive_speed_multiplier(reviver_count: int) -> float:
+	if reviver_count <= 1:
+		return 1.0
+	return minf(1.0 + float(reviver_count - 1) * REVIVE_EXTRA_HELPER_SPEED, REVIVE_MAX_SPEED_MULTIPLIER)
 
 
 func _revive_required_time(downed_player: Player) -> float:
@@ -2066,10 +2295,19 @@ func _upgrade_participant_peer_ids() -> Array:
 	var peer_ids := []
 	for peer_id in run_participant_peer_ids.keys():
 		var peer_int := int(peer_id)
-		if players.has(peer_int) and not waiting_peer_ids.has(peer_int):
+		if _is_peer_eligible_for_upgrade(peer_int):
 			peer_ids.append(peer_int)
 	peer_ids.sort()
 	return peer_ids
+
+
+func _is_peer_eligible_for_upgrade(peer_id: int) -> bool:
+	if waiting_peer_ids.has(peer_id):
+		return false
+	if not _is_peer_active_in_current_run(peer_id):
+		return false
+	var target_player := players.get(peer_id, null) as Player
+	return target_player != null and target_player.is_combat_active()
 
 
 func _apply_upgrade_to_peer(peer_id: int, upgrade: Dictionary) -> bool:
@@ -2268,6 +2506,8 @@ func _room_discovery_label(room: Dictionary) -> String:
 
 
 func _room_state_text(room_state: String) -> String:
+	if room_state == "results":
+		return "结算"
 	return "游戏中" if room_state == "running" else "大厅"
 
 
@@ -2494,7 +2734,8 @@ func _make_world_snapshot() -> Dictionary:
 			"weapon_status": _ensure_player_loadout(int(peer_id)).status_text(),
 			"downed": active_player.downed,
 			"revive_progress": active_player.revive_progress,
-			"down_count": active_player.down_count
+			"down_count": active_player.down_count,
+			"spawn_protection_timer": active_player.spawn_protection_timer
 		}
 
 	var zombies_data := []
@@ -2624,6 +2865,7 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		synced_player.downed = bool(player_data.get("downed", synced_player.downed))
 		synced_player.revive_progress = float(player_data.get("revive_progress", synced_player.revive_progress))
 		synced_player.down_count = int(player_data.get("down_count", synced_player.down_count))
+		synced_player.spawn_protection_timer = float(player_data.get("spawn_protection_timer", synced_player.spawn_protection_timer))
 		synced_player.set_display_color(player_data.get("body_color", synced_player.body_color))
 		if peer_id == local_peer_id:
 			synced_weapon_status_text = String(player_data.get("weapon_status", synced_weapon_status_text))
@@ -2680,7 +2922,7 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		var event := HoldoutEventState.new(
 			event_data.get("position", Vector2.ZERO),
 			float(event_data.get("radius", 112.0)),
-			float(event_data.get("required_time", 20.0)),
+			float(event_data.get("required_time", 16.0)),
 			float(event_data.get("lifetime", 90.0))
 		)
 		event.progress = float(event_data.get("progress", 0.0))
@@ -2695,7 +2937,7 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 	if lobby_overlay != null:
 		lobby_overlay.visible = false
 	if network_status_label != null and waiting_peer_ids.has(local_peer_id):
-		network_status_label.text = "本局进行中：观战中，下一局加入"
+		network_status_label.text = "本局已结算：等待下一局加入"
 	elif network_status_label != null and _is_network_client():
 		network_status_label.text = "局内：已连接房主"
 	if choosing_upgrade and _has_local_active_player():
@@ -2710,7 +2952,7 @@ func _apply_world_snapshot(snapshot: Dictionary) -> void:
 		if _is_peer_participant(local_peer_id):
 			_update_game_over_label()
 		else:
-			game_over_label.text = String(snapshot.get("game_over_text", "游戏结束")) + "\n\n你是观战玩家，本局不结算局外进度。"
+			game_over_label.text = String(snapshot.get("game_over_text", "游戏结束")) + "\n\n你在结算后加入，本局不结算局外进度。"
 	_update_hud()
 
 
@@ -2866,7 +3108,7 @@ func _update_hud() -> void:
 
 func _hud_player_state(status_player: Player) -> String:
 	if waiting_peer_ids.has(local_peer_id):
-		return "观战"
+		return "等待"
 	if status_player.downed:
 		return "倒地"
 	if game_over:
@@ -2880,12 +3122,15 @@ func _status_hint_text(status_player: Player) -> String:
 	if waiting_peer_ids.has(local_peer_id):
 		var target_peer_id := _first_active_view_peer_id()
 		if target_peer_id > 0:
-			return "观战中：正在观看 %s，本局结束后加入下一局。" % _peer_display_label(target_peer_id)
-		return "观战中：本局结束后加入下一局。"
+			return "等待下一局：当前显示 %s 的结算状态。" % _peer_display_label(target_peer_id)
+		return "等待下一局：房主重开后加入。"
+	if status_player.spawn_protection_timer > 0.0:
+		return "入场保护中：%.0f 秒内不会受到伤害。" % ceilf(status_player.spawn_protection_timer)
 	if status_player.downed:
 		var revive_percent := int(round(clampf(status_player.revive_progress, 0.0, 1.0) * 100.0))
-		if _has_reviver_nearby(status_player):
-			return "你已倒地：队友正在救援 %d%%。" % revive_percent
+		var reviver_count := _reviver_count_nearby(status_player)
+		if reviver_count > 0:
+			return "你已倒地：%d 名队友正在救援 %d%%。" % [reviver_count, revive_percent]
 		return "你已倒地：等待队友进入救援圈。"
 	if not status_player.is_combat_active():
 		return ""
@@ -2893,7 +3138,8 @@ func _status_hint_text(status_player: Player) -> String:
 	if nearby_downed_peer > 0:
 		var nearby_downed := players[nearby_downed_peer] as Player
 		var nearby_percent := int(round(clampf(nearby_downed.revive_progress, 0.0, 1.0) * 100.0)) if nearby_downed != null else 0
-		return "正在救援 %s  %d%%。" % [_peer_display_label(nearby_downed_peer), nearby_percent]
+		var helper_count := _reviver_count_nearby(nearby_downed) if nearby_downed != null else 1
+		return "正在救援 %s  %d%%（%d人加速）。" % [_peer_display_label(nearby_downed_peer), nearby_percent, helper_count]
 	var downed_peer := _nearest_downed_peer_for_player(status_player, false)
 	if downed_peer > 0:
 		return "%s 倒地，靠近救援圈复活队友。" % _peer_display_label(downed_peer)
@@ -2979,7 +3225,7 @@ func _restart_game() -> void:
 	kills = 0
 	level = 1
 	xp = 0
-	xp_to_next = 6
+	xp_to_next = INITIAL_XP_TO_NEXT
 	game_over = false
 	choosing_upgrade = false
 	last_unlock_messages.clear()

@@ -13,8 +13,8 @@ const RUSHER_RADIUS := 12.0
 const EXPLODER_RADIUS := 17.0
 const ELITE_RADIUS := 26.0
 
-const RUSHER_UNLOCK_TIME := 45.0
-const EXPLODER_UNLOCK_TIME := 90.0
+const RUSHER_UNLOCK_TIME := 65.0
+const EXPLODER_UNLOCK_TIME := 125.0
 const RUSHER_CHARGE_DURATION := 0.42
 const RUSHER_CHARGE_SPEED_MULTIPLIER := 2.35
 
@@ -53,17 +53,17 @@ static func radius_for(enemy_type: String) -> float:
 
 
 static func create_elite(rng: RandomNumberGenerator, position: Vector2, elapsed: float, rank: int):
-	var scaling := 1.0 + elapsed / 220.0
+	var scaling := 1.0 + elapsed / 260.0
 	var zombie = ZombieStateResource.new(
 		position,
-		260.0 * scaling + float(rank - 1) * 80.0,
+		210.0 * scaling + float(rank - 1) * 68.0,
 		rng.randf_range(72.0, 92.0) + elapsed * 0.045,
-		22.0 + elapsed * 0.028,
+		18.0 + elapsed * 0.024,
 		ELITE,
 		ELITE_RADIUS,
 		Color(0.78, 0.2, 0.16),
 		Color(1.0, 0.78, 0.18),
-		10 + rank * 2
+		16 + rank * 3
 	)
 	zombie.is_elite = true
 	zombie.elite_rank = rank
@@ -85,7 +85,7 @@ static func create_zombie(rng: RandomNumberGenerator, enemy_type: String, positi
 				RUSHER_RADIUS,
 				Color(0.86, 0.42, 0.16),
 				Color(1.0, 0.9, 0.18),
-				1
+				2
 			)
 			zombie.behavior_timer = rng.randf_range(0.7, 1.8)
 			return zombie
